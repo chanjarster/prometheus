@@ -55,7 +55,7 @@ func (h *Handler) updateConfig(w http.ResponseWriter, q *http.Request) {
 func (h *Handler) getLastUpdateTs(w http.ResponseWriter, q *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	_, err := w.Write([]byte(fmt.Sprintf(`{"code":200,"message":"success","lastUpdateTs":%d}`, h.sidecarSvc.GetLastUpdateTs().Unix())))
+	_, err := w.Write([]byte(fmt.Sprintf(`{"code":200,"message":"success","last_update_ts":%d}`, h.sidecarSvc.GetLastUpdateTs().Unix())))
 	if err != nil {
 		level.Error(h.logger).Log("err", err)
 	}

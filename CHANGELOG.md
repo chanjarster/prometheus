@@ -1,8 +1,12 @@
 # Changelog
 
+## 2.47.0-mod.1 / 2023-10-13
+
+* Polish configuration management API response
+
 ## 2.47.0-mod.0 / 2023-09-19
 
-Add configuration update reload function.
+* Add configuration update reload function.
 
 ## 2.47.0 / 2023-09-06
 
