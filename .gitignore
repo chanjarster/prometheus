@@ -31,3 +31,8 @@ npm_licenses.tar.bz2
 
 # Ignore parser debug
 y.output
+
+.idea
+/test-data/rules
+/test-data/secrets
+!.coding-ci.yml

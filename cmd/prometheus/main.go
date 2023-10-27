@@ -66,6 +66,7 @@ import (
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/rules"
 	"github.com/prometheus/prometheus/scrape"
+	"github.com/prometheus/prometheus/sidecar"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/storage/remote"
 	"github.com/prometheus/prometheus/tracing"
@@ -707,8 +708,11 @@ func main() {
 		cfg.web.Flags[f.Name] = f.Value.String()
 	}
 
+	// EXTENSION: 扩展的 sidecar 功能
+	sidecarSvc := sidecar.New(log.With(logger, "component", "sidecar"), cfg.configFile)
+
 	// Depends on cfg.web.ScrapeManager so needs to be after cfg.web.ScrapeManager = scrapeManager.
-	webHandler := web.New(log.With(logger, "component", "web"), &cfg.web)
+	webHandler := web.New(log.With(logger, "component", "web"), &cfg.web, sidecarSvc)
 
 	// Monitor outgoing connections on default transport with conntrack.
 	http.DefaultTransport.(*http.Transport).DialContext = conntrack.NewDialContextFunc(

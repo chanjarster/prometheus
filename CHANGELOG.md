@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.47.2-mod.0 / 2023-10-27
+
+* [FEATURE] Add configuration update reload function.
+
 ## 2.47.2 / 2023-10-11
 
 * [BUGFIX] TSDB: Fix counter reset edgecases causing native histogram panics. #12838

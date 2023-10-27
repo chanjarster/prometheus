@@ -57,6 +57,7 @@ import (
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/rules"
 	"github.com/prometheus/prometheus/scrape"
+	"github.com/prometheus/prometheus/sidecar"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/template"
 	"github.com/prometheus/prometheus/util/httputil"
@@ -213,6 +214,9 @@ type Handler struct {
 	now func() model.Time
 
 	ready atomic.Uint32 // ready is uint32 rather than boolean to be able to use atomic functions.
+
+	// EXTENSION: 扩展的 sidecar 功能
+	sidecarSvc sidecar.SidecarService
 }
 
 // ApplyConfig updates the config field of the Handler struct
@@ -268,7 +272,7 @@ type Options struct {
 }
 
 // New initializes a new web Handler.
-func New(logger log.Logger, o *Options) *Handler {
+func New(logger log.Logger, o *Options, sidecarSvc sidecar.SidecarService) *Handler {
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
@@ -309,6 +313,8 @@ func New(logger log.Logger, o *Options) *Handler {
 		notifier:        o.Notifier,
 
 		now: model.Now,
+
+		sidecarSvc: sidecarSvc,
 	}
 	h.SetReady(false)
 
@@ -452,6 +458,8 @@ func New(logger log.Logger, o *Options) *Handler {
 		router.Put("/-/quit", h.quit)
 		router.Post("/-/reload", h.reload)
 		router.Put("/-/reload", h.reload)
+		router.Put("/-/sidecar/config", h.testReady(h.updateConfig))
+		router.Get("/-/sidecar/last-update-ts", h.testReady(h.getLastUpdateTs))
 	} else {
 		forbiddenAPINotEnabled := func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusForbidden)
@@ -461,6 +469,8 @@ func New(logger log.Logger, o *Options) *Handler {
 		router.Put("/-/quit", forbiddenAPINotEnabled)
 		router.Post("/-/reload", forbiddenAPINotEnabled)
 		router.Put("/-/reload", forbiddenAPINotEnabled)
+		router.Put("/-/sidecar/config", forbiddenAPINotEnabled)
+		router.Get("/-/sidecar/last-update-ts", forbiddenAPINotEnabled)
 	}
 	router.Get("/-/quit", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
