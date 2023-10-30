@@ -33,20 +33,6 @@ import (
 	fsutil "github.com/prometheus/prometheus/sidecar/utils/fs"
 )
 
-var builtinJobs = map[string]bool{
-	"prometheus":   true,
-	"alertmanager": true,
-	"pushgateway":  true,
-	"blackbox":     true,
-}
-
-// isBuiltinJob 根据 Id / Name 判断是否内置 Job
-//
-// 目前的内置 Job 有 prometheus, alertmanager, pushgateway
-func isBuiltinJob(idOrName string) bool {
-	return builtinJobs[idOrName]
-}
-
 type ruleFileInner struct {
 	FileName string `json:"filename"`
 	Yaml     string `json:"yaml"`
@@ -185,12 +171,15 @@ func (s *sidecarService) normalizeSecretFiles(cmd *UpdateConfigCmd) (oldNewSecre
 
 // 更新 Prometheus Config 中所有和 Secret 有关的文件的信息
 func (s *sidecarService) updatePromConfigSecretFiles(config *p8sconfig.Config, oldNewSecretFileName map[string]string) {
-	// 目前只更新 scrape_config.basic_auth.password_file
+	// 更新 scrape_config.basic_auth.password_file
 	for _, scrapeConfig := range config.ScrapeConfigs {
-		if isBuiltinJob(scrapeConfig.JobName) {
-			continue
-		}
 		if ba := scrapeConfig.HTTPClientConfig.BasicAuth; ba != nil && ba.PasswordFile != "" {
+			ba.PasswordFile = oldNewSecretFileName[ba.PasswordFile]
+		}
+	}
+	// 更新 remote_write_config.basic_auth.password_file
+	for _, rwConfig := range config.RemoteWriteConfigs {
+		if ba := rwConfig.HTTPClientConfig.BasicAuth; ba != nil && ba.PasswordFile != "" {
 			ba.PasswordFile = oldNewSecretFileName[ba.PasswordFile]
 		}
 	}

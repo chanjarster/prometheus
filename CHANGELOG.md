@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.47.2-mod.1 / 2023-10-30
+
+* [BUGFIX] Wrong secret file path
+
 ## 2.47.2-mod.0 / 2023-10-27
 
 * [FEATURE] Add configuration update reload function.
