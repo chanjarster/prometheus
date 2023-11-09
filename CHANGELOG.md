@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.47.2-mod.2 / 2023-11-09
+
+* [ENHANCEMENT] Restore old configuration files if update failed
+
 ## 2.47.2-mod.1 / 2023-10-30
 
 * [BUGFIX] Wrong secret file path

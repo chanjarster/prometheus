@@ -15,6 +15,7 @@ package sidecar
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -61,7 +62,7 @@ func Test_sidecarService_normalizeCmdRuleFiles(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotRuleFileNames := s.normalizeCmdRuleFiles(tt.args.cmd)
+			gotRuleFileNames := s.normalizeRuleFiles(tt.args.cmd)
 			require.Equal(t, tt.wantRuleFileNames, gotRuleFileNames)
 			require.Equal(t, tt.wantRuleFiles, tt.args.cmd.RuleFiles)
 		})
@@ -197,9 +198,11 @@ func Test_sidecarService_writeSecretFiles(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tt.wantErr(t, s.writeSecretFiles(tt.args.cmd), fmt.Sprintf("writeSecretFiles(%v)", tt.args.cmd))
-			require.FileExists(t, filepath.Join(testDir, "secrets/secret-foo"))
-			require.FileExists(t, filepath.Join(testDir, "secrets/secret-bar"))
+			files, err2 := s.writeSecretFiles(tt.args.cmd.SecretFiles)
+			tt.wantErr(t, err2, fmt.Sprintf("writeSecretFiles(%v)", tt.args.cmd))
+			require.Len(t, files, 2)
+			require.FileExists(t, filepath.Join(testDir, "secrets", "secret-foo"))
+			require.FileExists(t, filepath.Join(testDir, "secrets", "secret-bar"))
 		})
 	}
 }
@@ -237,7 +240,9 @@ func Test_sidecarService_writeRuleFiles(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tt.wantErr(t, s.writeRuleFiles(tt.args.cmd), fmt.Sprintf("writeRuleFiles(%v)", tt.args.cmd))
+			files, err2 := s.writeRuleFiles(tt.args.cmd.RuleFiles)
+			tt.wantErr(t, err2, fmt.Sprintf("writeRuleFiles(%v)", tt.args.cmd))
+			require.Len(t, files, 2)
 			require.FileExists(t, filepath.Join(testDir, "rules/rules-foo"))
 			require.FileExists(t, filepath.Join(testDir, "rules/rules-bar"))
 		})
@@ -251,10 +256,17 @@ func Test_sidecarService_UpdateConfigReload(t *testing.T) {
 	defer os.RemoveAll(testDir)
 
 	configFile := filepath.Join(testDir, "prometheus.yml")
-	testConfigYaml, err := os.ReadFile("../test-data/prometheus.yml")
+	templateConfigYaml, err := os.ReadFile("../test-data/prometheus.yml")
 	require.NoError(t, err)
-	err = os.WriteFile(configFile, testConfigYaml, 0o666)
-	require.NoError(t, err)
+
+	// 预先准备一些文件
+	require.NoError(t, os.MkdirAll(filepath.Join(testDir, "secrets"), 0o777))
+	require.NoError(t, os.MkdirAll(filepath.Join(testDir, "rules"), 0o777))
+	require.NoError(t, os.WriteFile(configFile, templateConfigYaml, 0o666))
+	require.NoError(t, os.WriteFile(filepath.Join(testDir, "secrets", "secret-a"), []byte("secret-a"), 0o666))
+	require.NoError(t, os.WriteFile(filepath.Join(testDir, "secrets", "secret-b"), []byte("secret-b"), 0o666))
+	require.NoError(t, os.WriteFile(filepath.Join(testDir, "rules", "rules-a"), []byte("rules-a"), 0o666))
+	require.NoError(t, os.WriteFile(filepath.Join(testDir, "rules", "rules-b"), []byte("rules-b"), 0o666))
 
 	s := &sidecarService{
 		logger:     log.NewLogfmtLogger(os.Stdout),
@@ -266,8 +278,8 @@ func Test_sidecarService_UpdateConfigReload(t *testing.T) {
 	cmd := &UpdateConfigCmd{
 		Yaml: "global:\n  scrape_interval: 15s\n  scrape_timeout: 10s\n  evaluation_interval: 15s\nalerting:\n  alertmanagers:\n  - follow_redirects: true\n    enable_http2: true\n    scheme: http\n    timeout: 10s\n    api_version: v2\n    static_configs:\n    - targets: []\nscrape_configs:\n- job_name: prometheus\n  honor_timestamps: true\n  scrape_interval: 15s\n  scrape_timeout: 10s\n  metrics_path: /metrics\n  scheme: http\n  follow_redirects: true\n  enable_http2: true\n  static_configs:\n  - targets:\n    - localhost:9090\n",
 		RuleFiles: []ruleFileInner{
-			{FileName: "rules-foo", Yaml: "groups: []"},
-			{FileName: "rules-bar", Yaml: "groups: []"},
+			{FileName: "foo", Yaml: "groups: []"},
+			{FileName: "bar", Yaml: "groups: []"},
 		},
 		SecretFiles: []secretFileInner{
 			{FileName: "foo", Secret: "bar"},
@@ -282,9 +294,78 @@ func Test_sidecarService_UpdateConfigReload(t *testing.T) {
 	}()
 	err = s.UpdateConfigReload(context.TODO(), cmd, reloadCh)
 	require.NoError(t, err)
-	require.FileExists(t, filepath.Join(testDir, "secrets/secret-foo"))
-	require.FileExists(t, filepath.Join(testDir, "secrets/secret-bar"))
-	// require.FileExists(t, filepath.Join(testDir, "rules/rules-foo"))
-	// require.FileExists(t, filepath.Join(testDir, "rules/rules-bar"))
 	require.NotEqual(t, time.Time{}, s.GetLastUpdateTs())
+
+	require.FileExists(t, filepath.Join(testDir, "secrets", "secret-foo"))
+	require.FileExists(t, filepath.Join(testDir, "secrets", "secret-bar"))
+	require.FileExists(t, filepath.Join(testDir, "rules", "rules-foo"))
+	require.FileExists(t, filepath.Join(testDir, "rules", "rules-bar"))
+
+	require.NoFileExists(t, filepath.Join(testDir, "secrets", "secret-a"))
+	require.NoFileExists(t, filepath.Join(testDir, "secrets", "secret-b"))
+	require.NoFileExists(t, filepath.Join(testDir, "rules", "rules-a"))
+	require.NoFileExists(t, filepath.Join(testDir, "rules", "rules-b"))
+}
+
+func Test_sidecarService_UpdateConfigReload_ErrorRestore(t *testing.T) {
+	testDir, err := os.MkdirTemp("", "prom-config")
+	require.NoError(t, err)
+	fmt.Println("test dir:", testDir)
+	defer os.RemoveAll(testDir)
+
+	configFile := filepath.Join(testDir, "prometheus.yml")
+	templateConfigYaml, err := os.ReadFile("../test-data/prometheus.yml")
+	require.NoError(t, err)
+
+	// 预先准备一些文件
+	require.NoError(t, os.MkdirAll(filepath.Join(testDir, "secrets"), 0o777))
+	require.NoError(t, os.MkdirAll(filepath.Join(testDir, "rules"), 0o777))
+	require.NoError(t, os.WriteFile(configFile, templateConfigYaml, 0o666))
+	require.NoError(t, os.WriteFile(filepath.Join(testDir, "secrets", "secret-a"), []byte("secret-a"), 0o666))
+	require.NoError(t, os.WriteFile(filepath.Join(testDir, "secrets", "secret-b"), []byte("secret-b"), 0o666))
+	require.NoError(t, os.WriteFile(filepath.Join(testDir, "rules", "rules-a"), []byte("rules-a"), 0o666))
+	require.NoError(t, os.WriteFile(filepath.Join(testDir, "rules", "rules-b"), []byte("rules-b"), 0o666))
+
+	s := &sidecarService{
+		logger:     log.NewLogfmtLogger(os.Stdout),
+		configFile: configFile,
+	}
+
+	require.Equal(t, time.Time{}, s.GetLastUpdateTs())
+
+	cmd := &UpdateConfigCmd{
+		Yaml: "global:\n  scrape_interval: 15s\n  scrape_timeout: 10s\n  evaluation_interval: 15s\nalerting:\n  alertmanagers:\n  - follow_redirects: true\n    enable_http2: true\n    scheme: http\n    timeout: 10s\n    api_version: v2\n    static_configs:\n    - targets: []\nscrape_configs:\n- job_name: prometheus\n  honor_timestamps: true\n  scrape_interval: 15s\n  scrape_timeout: 10s\n  metrics_path: /metrics\n  scheme: http\n  follow_redirects: true\n  enable_http2: true\n  static_configs:\n  - targets:\n    - localhost:9090\n",
+		RuleFiles: []ruleFileInner{
+			{FileName: "foo", Yaml: "groups: []"},
+			{FileName: "bar", Yaml: "groups: []"},
+		},
+		SecretFiles: []secretFileInner{
+			{FileName: "foo", Secret: "bar"},
+			{FileName: "bar", Secret: "blah blah"},
+		},
+	}
+
+	reloadCh := make(chan chan error)
+	go func() {
+		ch := <-reloadCh
+		ch <- errors.New("on purpose")
+	}()
+	err = s.UpdateConfigReload(context.TODO(), cmd, reloadCh)
+	require.Error(t, err)
+
+	configFileYaml, err := os.ReadFile(configFile)
+	require.NoError(t, err)
+	require.Equal(t, templateConfigYaml, configFileYaml)
+
+	require.Equal(t, time.Time{}, s.GetLastUpdateTs())
+
+	require.NoFileExists(t, filepath.Join(testDir, "secrets", "secret-foo"))
+	require.NoFileExists(t, filepath.Join(testDir, "secrets", "secret-bar"))
+	require.NoFileExists(t, filepath.Join(testDir, "rules", "rules-foo"))
+	require.NoFileExists(t, filepath.Join(testDir, "rules", "rules-bar"))
+
+	require.FileExists(t, filepath.Join(testDir, "secrets", "secret-a"))
+	require.FileExists(t, filepath.Join(testDir, "secrets", "secret-b"))
+	require.FileExists(t, filepath.Join(testDir, "rules", "rules-a"))
+	require.FileExists(t, filepath.Join(testDir, "rules", "rules-b"))
 }

@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
 	"gopkg.in/yaml.v3"
 
@@ -129,8 +130,10 @@ type sidecarService struct {
 }
 
 const (
-	rulesDir   = "rules"
-	secretsDir = "secrets"
+	rulesDir          = "rules"
+	secretsDir        = "secrets"
+	ruleFilePattern   = "rules-*"
+	secretFilePattern = "secret-*"
 )
 
 func (s *sidecarService) GetLastUpdateTs() time.Time {
@@ -140,7 +143,7 @@ func (s *sidecarService) GetLastUpdateTs() time.Time {
 }
 
 // 修改 Cmd 中 RuleFile 的文件名，修改路径为 rules/rules-* ，同时返回修改后的文件名列表
-func (s *sidecarService) normalizeCmdRuleFiles(cmd *UpdateConfigCmd) (ruleFileNames []string) {
+func (s *sidecarService) normalizeRuleFiles(cmd *UpdateConfigCmd) (ruleFileNames []string) {
 	ruleFileNames = make([]string, len(cmd.RuleFiles))
 	for i, rf := range cmd.RuleFiles {
 		// 去掉文件名中的特殊符号, 并修改文件名，rules-*
@@ -186,26 +189,52 @@ func (s *sidecarService) updatePromConfigSecretFiles(config *p8sconfig.Config, o
 }
 
 // 规则文件写到磁盘
-func (s *sidecarService) writeRuleFiles(cmd *UpdateConfigCmd) error {
+func (s *sidecarService) writeRuleFiles(ruleFiles []ruleFileInner) ([]string, error) {
 	basedir := filepath.Join(filepath.Dir(s.configFile), rulesDir)
-	fileContents := make([]fsutil.FileContent, 0, len(cmd.RuleFiles))
-	for _, rf := range cmd.RuleFiles {
+	fileContents := make([]fsutil.FileContent, 0, len(ruleFiles))
+	for _, rf := range ruleFiles {
 		fileContents = append(fileContents, fsutil.FileContent{Filename: rf.FileName, Content: []byte(rf.Yaml)})
 	}
-	// 清空旧的规则文件
-	// 写入新的规则文件
-	return fsutil.RefreshDirFiles(s.logger, 0o755, basedir, "rules-*.yaml", 0o644, fileContents)
+	return fsutil.WriteDirFiles(0o755, basedir, 0o644, fileContents)
 }
 
-func (s *sidecarService) writeSecretFiles(cmd *UpdateConfigCmd) error {
+func (s *sidecarService) backupRuleFiles() error {
+	basedir := filepath.Join(filepath.Dir(s.configFile), rulesDir)
+	return fsutil.BackupDirFiles(basedir, ruleFilePattern)
+}
+
+func (s *sidecarService) cleanBackupRuleFiles() error {
+	basedir := filepath.Join(filepath.Dir(s.configFile), rulesDir)
+	return fsutil.CleanBackupDirFiles(basedir, ruleFilePattern)
+}
+
+func (s *sidecarService) restoreRuleFiles() error {
+	basedir := filepath.Join(filepath.Dir(s.configFile), rulesDir)
+	return fsutil.RestoreDirFiles(basedir, ruleFilePattern)
+}
+
+func (s *sidecarService) writeSecretFiles(secretFiles []secretFileInner) ([]string, error) {
 	basedir := filepath.Join(filepath.Dir(s.configFile), secretsDir)
-	fileContents := make([]fsutil.FileContent, 0, len(cmd.SecretFiles))
-	for _, sf := range cmd.SecretFiles {
+	fileContents := make([]fsutil.FileContent, 0, len(secretFiles))
+	for _, sf := range secretFiles {
 		fileContents = append(fileContents, fsutil.FileContent{Filename: sf.FileName, Content: []byte(sf.Secret)})
 	}
-	// 清空旧的 Secret 文件
-	// 写入新的 Secret 文件
-	return fsutil.RefreshDirFiles(s.logger, 0o755, basedir, "secret-*.yaml", 0o644, fileContents)
+	return fsutil.WriteDirFiles(0o755, basedir, 0o644, fileContents)
+}
+
+func (s *sidecarService) backupSecretFiles() error {
+	basedir := filepath.Join(filepath.Dir(s.configFile), secretsDir)
+	return fsutil.BackupDirFiles(basedir, secretFilePattern)
+}
+
+func (s *sidecarService) restoreSecretFiles() error {
+	basedir := filepath.Join(filepath.Dir(s.configFile), secretsDir)
+	return fsutil.RestoreDirFiles(basedir, secretFilePattern)
+}
+
+func (s *sidecarService) cleanBackupSecretFiles() error {
+	basedir := filepath.Join(filepath.Dir(s.configFile), secretsDir)
+	return fsutil.CleanBackupDirFiles(basedir, secretFilePattern)
 }
 
 func (s *sidecarService) writePromConfigFile(config *p8sconfig.Config) error {
@@ -221,6 +250,18 @@ func (s *sidecarService) writePromConfigFile(config *p8sconfig.Config) error {
 	return nil
 }
 
+func (s *sidecarService) backupPromConfigFile() error {
+	return fsutil.BackupFile(s.configFile)
+}
+
+func (s *sidecarService) cleanBackupPromConfigFile() error {
+	return fsutil.CleanBackupFile(s.configFile)
+}
+
+func (s *sidecarService) restorePromConfigFile() error {
+	return fsutil.RestoreFile(s.configFile)
+}
+
 func (s *sidecarService) UpdateConfigReload(ctx context.Context, cmd *UpdateConfigCmd, reloadCh chan chan error) error {
 	s.lock.Lock()
 	defer s.lock.Unlock()
@@ -231,7 +272,7 @@ func (s *sidecarService) UpdateConfigReload(ctx context.Context, cmd *UpdateConf
 	}
 
 	// 更新规则文件名
-	ruleFileNames := s.normalizeCmdRuleFiles(cmd)
+	ruleFileNames := s.normalizeRuleFiles(cmd)
 	// 更新 Secret 文件名
 	oldNewSecretFileName := s.normalizeSecretFiles(cmd)
 
@@ -240,25 +281,75 @@ func (s *sidecarService) UpdateConfigReload(ctx context.Context, cmd *UpdateConf
 	s.updatePromConfigRuleFiles(config, ruleFileNames)
 	s.updatePromConfigSecretFiles(config, oldNewSecretFileName)
 
-	if err := s.writePromConfigFile(config); err != nil {
-		return err
+	var reloadErr error
+	writtenFiles := make([]string, 0, len(cmd.RuleFiles)+len(cmd.SecretFiles))
+
+	defer func() {
+		if reloadErr == nil {
+			s.lastUpdateTs = time.Now()
+
+			// 没有出错
+			s.printErr(s.cleanBackupRuleFiles())
+			s.printErr(s.cleanBackupSecretFiles())
+			s.printErr(s.cleanBackupPromConfigFile())
+		} else {
+			// 出错了
+			s.printErr(s.restoreRuleFiles())
+			s.printErr(s.restoreSecretFiles())
+			s.printErr(s.restorePromConfigFile())
+			// TODO 删掉之前写入的文件
+			s.printErr(fsutil.RemoveFiles(writtenFiles))
+		}
+	}()
+
+	if reloadErr = s.backupPromConfigFile(); reloadErr != nil {
+		return reloadErr
+	}
+	if reloadErr = s.backupRuleFiles(); reloadErr != nil {
+		return reloadErr
+	}
+	if reloadErr = s.backupSecretFiles(); reloadErr != nil {
+		return reloadErr
 	}
 
+	// 配置文件写到磁盘
+	if reloadErr = s.writePromConfigFile(config); reloadErr != nil {
+		return reloadErr
+	}
 	// 规则文件写到磁盘
-	if err := s.writeRuleFiles(cmd); err != nil {
-		return err
+	if wFiles, subReloadErr := s.writeRuleFiles(cmd.RuleFiles); reloadErr != nil {
+		reloadErr = subReloadErr
+		writtenFiles = append(writtenFiles, wFiles...)
+		return reloadErr
+	} else {
+		writtenFiles = append(writtenFiles, wFiles...)
 	}
 	// Secret 文件写到磁盘
-	if err := s.writeSecretFiles(cmd); err != nil {
-		return err
+	if wFiles, subReloadErr := s.writeSecretFiles(cmd.SecretFiles); reloadErr != nil {
+		reloadErr = subReloadErr
+		writtenFiles = append(writtenFiles, wFiles...)
+		return reloadErr
+	} else {
+		writtenFiles = append(writtenFiles, wFiles...)
 	}
 
 	// 指示 Prometheus reload 配置文件
-	err := s.doReload(reloadCh)
+	reloadErr = s.doReload(reloadCh)
+	return reloadErr
+}
+
+func (s *sidecarService) printErr(err error) {
 	if err == nil {
-		s.lastUpdateTs = time.Now()
+		return
 	}
-	return err
+
+	if errList, ok := err.(fsutil.ErrorList); ok {
+		for _, err2 := range errList {
+			level.Warn(s.logger).Log("err", err2)
+		}
+	} else {
+		level.Warn(s.logger).Log("err", err)
+	}
 }
 
 func (s *sidecarService) doReload(reloadCh chan chan error) error {

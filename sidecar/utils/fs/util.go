@@ -32,36 +32,66 @@ type FileContent struct {
 	Content  []byte
 }
 
-// RefreshDirFiles 清空 dir 下的所有匹配 filePattern 的文件，然后写入新文件
-func RefreshDirFiles(logger log.Logger,
-	dirperm fs.FileMode, dir string,
-	filePattern string, fileperm fs.FileMode, fileContents []FileContent,
-) error {
+func WriteDirFiles(dirperm fs.FileMode, dir string,
+	fileperm fs.FileMode, fileContents []FileContent,
+) ([]string, error) {
+	writtenFiles := make([]string, 0, len(fileContents))
+
 	if err := os.MkdirAll(dir, dirperm); err != nil {
-		return errors.Wrapf(err, "mkdir %s failed", dir)
+		return writtenFiles, errors.Wrapf(err, "mkdir %s failed", dir)
 	}
 
-	// 清空的规则文件
+	errList := make(ErrorList, 0, len(fileContents))
+	// 写入新的规则文件
+	for _, rf := range fileContents {
+		writtenFile := filepath.Join(dir, rf.Filename)
+		if err := os.WriteFile(writtenFile, rf.Content, fileperm); err != nil {
+			errList = append(errList, errors.Wrapf(err, "Write file %q failed", rf.Filename))
+		} else {
+			writtenFiles = append(writtenFiles, writtenFile)
+		}
+	}
+
+	if len(errList) == 0 {
+		return writtenFiles, nil
+	}
+	return writtenFiles, errList
+}
+
+func RemoveFiles(files []string) error {
+	errList := make(ErrorList, 0, len(files))
+
+	for _, file := range files {
+		if err := os.Remove(file); err != nil {
+			errList = append(errList, errors.Wrapf(err, "Remove file %q failed", file))
+		}
+	}
+
+	if len(errList) == 0 {
+		return nil
+	}
+	return errList
+}
+
+// RemoveFilesByPattern 清空 dir 下的所有匹配 filePattern 的文件
+func RemoveFilesByPattern(dir, filePattern string) error {
 	searchPattern := filepath.Join(dir, filePattern)
 	existFiles, err := filepath.Glob(searchPattern)
 	if err != nil {
 		return errors.Wrapf(err, "Search files %q failed", searchPattern)
 	}
+	errList := make(ErrorList, 0, len(existFiles))
+
 	for _, file := range existFiles {
-		err = os.Remove(file)
-		if err != nil && logger != nil {
-			level.Warn(logger).Log("msg", fmt.Sprintf("Remove file %q failed", file), "err", err)
+		if err := os.Remove(file); err != nil {
+			errList = append(errList, errors.Wrapf(err, "Remove file %q failed", file))
 		}
 	}
 
-	// 写入新的规则文件
-	for _, rf := range fileContents {
-		err = os.WriteFile(filepath.Join(dir, rf.Filename), rf.Content, fileperm)
-		if err != nil {
-			return errors.Wrapf(err, "Write file %q failed", rf.Filename)
-		}
+	if len(errList) == 0 {
+		return nil
 	}
-	return nil
+	return errList
 }
 
 const (
@@ -120,4 +150,118 @@ func ScanDir(logger log.Logger, dir string, filenameSuffixes FilenameSuffixes, c
 		}
 	}
 	return nil
+}
+
+const (
+	backupSuffix = ".del"
+)
+
+// RestoreDirFiles 从 *.del 文件还原
+func RestoreDirFiles(dir, originFilePattern string) error {
+	searchPattern := filepath.Join(dir, originFilePattern+backupSuffix)
+	existBackupFiles, err := filepath.Glob(searchPattern)
+	if err != nil {
+		return errors.Wrapf(err, "Search files %q failed", searchPattern)
+	}
+
+	errList := make(ErrorList, 0, 10)
+
+	for _, backupFile := range existBackupFiles {
+		originFile := strings.TrimSuffix(backupFile, backupSuffix)
+		if err := RestoreFile(originFile); err != nil {
+			errList = append(errList, err)
+		}
+	}
+
+	if len(errList) == 0 {
+		return nil
+	}
+	return errList
+}
+
+// CleanBackupDirFiles 清空 *.del 的备份文件
+func CleanBackupDirFiles(dir, originFilePattern string) error {
+	searchPattern := filepath.Join(dir, originFilePattern+backupSuffix)
+	existBackupFiles, err := filepath.Glob(searchPattern)
+	if err != nil {
+		return errors.Wrapf(err, "Search files %q failed", searchPattern)
+	}
+
+	errList := make(ErrorList, 0, 10)
+
+	for _, backupFile := range existBackupFiles {
+		originFile := strings.TrimSuffix(backupFile, backupSuffix)
+		if err := CleanBackupFile(originFile); err != nil {
+			errList = append(errList, err)
+		}
+	}
+
+	if len(errList) == 0 {
+		return nil
+	}
+	return errList
+}
+
+// BackupDirFiles 把原始文件改个名字变成 *.del
+func BackupDirFiles(dir, filePattern string) error {
+	searchPattern := filepath.Join(dir, filePattern)
+	existFiles, err := filepath.Glob(searchPattern)
+	if err != nil {
+		return errors.Wrapf(err, "Search files %q failed", searchPattern)
+	}
+
+	errList := make(ErrorList, 0, 10)
+	for _, file := range existFiles {
+		if err := BackupFile(file); err != nil {
+			errList = append(errList, err)
+		}
+	}
+
+	if len(errList) == 0 {
+		return nil
+	}
+	return errList
+}
+
+// RestoreFile 从 *.del 文件还原，如果 *.del 文件不存在，那什么都不会发生
+func RestoreFile(originFile string) error {
+	backupFile := originFile + backupSuffix
+	if err := os.Rename(backupFile, originFile); os.IsNotExist(err) {
+		return nil
+	} else {
+		return errors.Wrapf(err, "Restore file %q failed", backupFile)
+	}
+}
+
+// CleanBackupFile 清空 *.del 的备份文件，如果 *.del 文件不存在，那什么都不会发生
+func CleanBackupFile(originFile string) error {
+	backupFile := originFile + backupSuffix
+	if err := os.Remove(backupFile); os.IsNotExist(err) {
+		return nil
+	} else {
+		return errors.Wrapf(err, "Remove backup file %q failed", backupFile)
+	}
+}
+
+// BackupFile 把原始文件改个名字变成 *.del，如果原始文件不存在，那什么都不会发生
+func BackupFile(originFile string) error {
+	backupFile := originFile + backupSuffix
+	if err := os.Rename(originFile, backupFile); os.IsNotExist(err) {
+		return nil
+	} else {
+		return errors.Wrapf(err, "Move file %q => %q failed", originFile, backupFile)
+	}
+}
+
+type ErrorList []error
+
+func (el ErrorList) Error() string {
+	sb := &strings.Builder{}
+	for i, err := range el {
+		sb.WriteString(fmt.Sprintf("error[%d]: %s", i, err.Error()))
+		if i < len(el)-1 {
+			sb.WriteString("\n")
+		}
+	}
+	return sb.String()
 }
