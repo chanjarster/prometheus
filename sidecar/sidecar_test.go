@@ -29,7 +29,7 @@ import (
 	p8sconfig "github.com/prometheus/prometheus/config"
 )
 
-func Test_sidecarService_normalizeCmdRuleFiles(t *testing.T) {
+func Test_sidecarService_normalizeRuleFiles(t *testing.T) {
 	s := &sidecarService{
 		logger:     log.NewLogfmtLogger(os.Stdout),
 		configFile: "/home/test/prometheus.yml",
@@ -57,7 +57,10 @@ func Test_sidecarService_normalizeCmdRuleFiles(t *testing.T) {
 				{FileName: "rules-foo.yaml", Yaml: "bar"},
 				{FileName: "rules-bar.yml", Yaml: "blah blah"},
 			},
-			wantRuleFileNames: []string{"rules/rules-foo.yaml", "rules/rules-bar.yml"},
+			wantRuleFileNames: []string{
+				filepath.Join("rules", "rules-foo.yaml"),
+				filepath.Join("rules", "rules-bar.yml"),
+			},
 		},
 	}
 	for _, tt := range tests {
@@ -98,8 +101,8 @@ func Test_sidecarService_normalizeSecretFiles(t *testing.T) {
 				{FileName: "secret-bar", Secret: "blah blah"},
 			},
 			wantOldNewSecretFileName: map[string]string{
-				"foo": "secrets/secret-foo",
-				"bar": "secrets/secret-bar",
+				"foo": filepath.Join("secrets", "secret-foo"),
+				"bar": filepath.Join("secrets", "secret-bar"),
 			},
 		},
 	}
