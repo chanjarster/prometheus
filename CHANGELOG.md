@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.47.2-mod.3 / 2023-11-23
+
+* [ENHANCEMENT] Check ZoneId when update configuration
+* [ENHANCEMENT] Add API for reset configuration
+
 ## 2.47.2-mod.2 / 2023-11-09
 
 * [ENHANCEMENT] Restore old configuration files if update failed

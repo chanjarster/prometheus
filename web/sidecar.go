@@ -56,10 +56,43 @@ func (h *Handler) updateConfig(w http.ResponseWriter, q *http.Request) {
 
 // EXTENSION: 扩展的 sidecar 功能
 func (h *Handler) getLastUpdateTs(w http.ResponseWriter, q *http.Request) {
+	boundZoneId, ts := h.sidecarSvc.GetLastUpdateTs()
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	_, err := w.Write([]byte(fmt.Sprintf(`{"code":200,"message":"success","last_update_ts":%d}`, h.sidecarSvc.GetLastUpdateTs().UnixMilli())))
+	_, err := fmt.Fprintf(w, `{"code":200,"message":"success","zone_id":%q,"last_update_ts":%d}`,
+		boundZoneId, ts.UnixMilli())
 	if err != nil {
 		level.Error(h.logger).Log("err", err)
 	}
+}
+
+// EXTENSION: 扩展的 sidecar 功能
+func (h *Handler) resetConfig(w http.ResponseWriter, q *http.Request) {
+	h.logger.Log("msg", "Resetting configuration")
+
+	var cmd sidecar.ResetConfigCmd
+	err := json.NewDecoder(q.Body).Decode(&cmd)
+	if err != nil {
+		errmsg := fmt.Sprintf("Parse request json error: %s", err.Error())
+		h.logger.Log("msg", errmsg)
+		http.Error(w, errmsg, http.StatusBadRequest)
+		return
+	}
+	err = h.sidecarSvc.ResetConfigReload(q.Context(), cmd.ZoneId, h.reloadCh)
+	if err != nil {
+		errmsg := fmt.Sprintf("Reset configuration error: %s", err.Error())
+		h.logger.Log("msg", errmsg)
+		http.Error(w, errmsg, http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, err = w.Write([]byte(`{"code":200,"message":"success"}`))
+	if err != nil {
+		level.Error(h.logger).Log("err", err)
+		return
+	}
+
+	h.logger.Log("msg", "Completed resetting configuration")
 }

@@ -460,6 +460,8 @@ func New(logger log.Logger, o *Options, sidecarSvc sidecar.SidecarService) *Hand
 		router.Put("/-/reload", h.reload)
 		router.Put("/-/sidecar/config", h.testReady(h.updateConfig))
 		router.Get("/-/sidecar/last-update-ts", h.testReady(h.getLastUpdateTs))
+		router.Post("/-/sidecar/reset-config", h.testReady(h.resetConfig))
+
 	} else {
 		forbiddenAPINotEnabled := func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusForbidden)

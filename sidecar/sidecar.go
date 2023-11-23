@@ -67,6 +67,7 @@ func (sf secretFileInner) Validate() errs.ValidateErrors {
 }
 
 type UpdateConfigCmd struct {
+	ZoneId      string            `json:"zone_id"`
 	Yaml        string            `json:"yaml"`
 	RuleFiles   []ruleFileInner   `json:"rule_files"`
 	SecretFiles []secretFileInner `json:"secret_files"`
@@ -74,7 +75,10 @@ type UpdateConfigCmd struct {
 
 func (cmd *UpdateConfigCmd) Validate(logger log.Logger) errs.ValidateErrors {
 	ves := make(errs.ValidateErrors, 0)
-	if strings.TrimSpace(cmd.Yaml) == "" {
+	if cmd.ZoneId = strings.TrimSpace(cmd.ZoneId); cmd.ZoneId == "" {
+		ves = append(ves, "ZoneId must not be blank")
+	}
+	if cmd.Yaml = strings.TrimSpace(cmd.Yaml); cmd.Yaml == "" {
 		ves = append(ves, "Yaml must not be blank")
 	}
 	for i, rf := range cmd.RuleFiles {
@@ -105,11 +109,26 @@ func (cmd *UpdateConfigCmd) ToPromConfig(logger log.Logger) (*p8sconfig.Config, 
 	return p8sconfig.Load(cmd.Yaml, false, logger)
 }
 
+type ResetConfigCmd struct {
+	ZoneId string `json:"zone_id"`
+}
+
 type SidecarService interface {
-	// UpdateConfigReload 更新 Prometheus 配置文件，并且指示 Prometheus reload
+	// UpdateConfigReload 更新 Prometheus 配置文件
+	//  更新 Prometheus 配置文件，包括 secret 和 rule 文件
+	//  把 Prometheus 和 ZoneId 绑定（如之前没绑定过，否则报错）
+	//  更新 “配置变更时间戳”
+	//  指示 Prometheus reload，
 	UpdateConfigReload(ctx context.Context, cmd *UpdateConfigCmd, reloadCh chan chan error) error
-	// GetLastUpdateTs 获得上一次更新配置文件的时间
-	GetLastUpdateTs() time.Time
+
+	// GetLastUpdateTs 获得上一次更新配置文件的时间，以及绑定的 ZoneId
+	GetLastUpdateTs() (boundZoneId string, ts time.Time)
+
+	// ResetConfigReload 恢复 Prometheus 的配置
+	//  清空所有配置
+	//  清空 “配置变更时间戳”
+	//  指示 Prometheus reload
+	ResetConfigReload(ctx context.Context, zoneId string, reloadCh chan chan error) error
 }
 
 func New(logger log.Logger, configFile string) SidecarService {
@@ -126,6 +145,7 @@ type sidecarService struct {
 	logger       log.Logger
 	configFile   string
 	lock         sync.Mutex
+	boundZoneId  string    // 当前所绑定的 zoneId
 	lastUpdateTs time.Time // 上一次更新配置文件的时间戳
 }
 
@@ -136,10 +156,10 @@ const (
 	secretFilePattern = "secret-*"
 )
 
-func (s *sidecarService) GetLastUpdateTs() time.Time {
+func (s *sidecarService) GetLastUpdateTs() (boundZoneId string, ts time.Time) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	return s.lastUpdateTs
+	return s.boundZoneId, s.lastUpdateTs
 }
 
 // 修改 Cmd 中 RuleFile 的文件名，修改路径为 rules/rules-* ，同时返回修改后的文件名列表
@@ -271,6 +291,10 @@ func (s *sidecarService) UpdateConfigReload(ctx context.Context, cmd *UpdateConf
 		return verrs
 	}
 
+	if err := s.assertZoneIdMatch(cmd.ZoneId); err != nil {
+		return err
+	}
+
 	// 更新规则文件名
 	ruleFileNames := s.normalizeRuleFiles(cmd)
 	// 更新 Secret 文件名
@@ -287,7 +311,7 @@ func (s *sidecarService) UpdateConfigReload(ctx context.Context, cmd *UpdateConf
 	defer func() {
 		if reloadErr == nil {
 			s.lastUpdateTs = time.Now()
-
+			s.bindZoneId(cmd.ZoneId)
 			// 没有出错
 			s.printErr(s.cleanBackupRuleFiles())
 			s.printErr(s.cleanBackupSecretFiles())
@@ -297,7 +321,6 @@ func (s *sidecarService) UpdateConfigReload(ctx context.Context, cmd *UpdateConf
 			s.printErr(s.restoreRuleFiles())
 			s.printErr(s.restoreSecretFiles())
 			s.printErr(s.restorePromConfigFile())
-			// TODO 删掉之前写入的文件
 			s.printErr(fsutil.RemoveFiles(writtenFiles))
 		}
 	}()
@@ -350,6 +373,87 @@ func (s *sidecarService) printErr(err error) {
 	} else {
 		level.Warn(s.logger).Log("err", err)
 	}
+}
+
+const (
+	emptyCfgYaml = `global:
+  evaluation_interval: 15s
+  scrape_interval: 15s
+  scrape_timeout: 10s`
+)
+
+func (s *sidecarService) ResetConfigReload(ctx context.Context, zoneId string, reloadCh chan chan error) error {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	if zoneId = strings.TrimSpace(zoneId); zoneId == "" {
+		return errs.ValidateError("ZoneId must not be blank")
+	}
+
+	if err := s.assertZoneIdMatch(zoneId); err != nil {
+		return err
+	}
+
+	var reloadErr error
+
+	defer func() {
+		if reloadErr == nil {
+			s.lastUpdateTs = time.Time{}
+			// 没有出错
+			s.printErr(s.cleanBackupRuleFiles())
+			s.printErr(s.cleanBackupSecretFiles())
+			s.printErr(s.cleanBackupPromConfigFile())
+		} else {
+			// 出错了
+			s.printErr(s.restoreRuleFiles())
+			s.printErr(s.restoreSecretFiles())
+			s.printErr(s.restorePromConfigFile())
+		}
+	}()
+	if reloadErr = s.backupPromConfigFile(); reloadErr != nil {
+		return reloadErr
+	}
+	if reloadErr = s.backupRuleFiles(); reloadErr != nil {
+		return reloadErr
+	}
+	if reloadErr = s.backupSecretFiles(); reloadErr != nil {
+		return reloadErr
+	}
+
+	var emptyCfg *p8sconfig.Config
+	emptyCfg, reloadErr = p8sconfig.Load(emptyCfgYaml, false, s.logger)
+	if reloadErr != nil {
+		return reloadErr
+	}
+
+	// 配置文件写到磁盘
+	if reloadErr = s.writePromConfigFile(emptyCfg); reloadErr != nil {
+		return reloadErr
+	}
+
+	// 指示 Prometheus reload 配置文件
+	reloadErr = s.doReload(reloadCh)
+	return reloadErr
+}
+
+func (s *sidecarService) assertZoneIdMatch(zoneId string) error {
+	if s.boundZoneId == "" {
+		// 这个 prometheus 还没有和 zone 绑定过
+		return nil
+	}
+	if s.boundZoneId != zoneId {
+		return errs.ValidateErrorf("Current prometheus bound zoneId=%s, command zoneId=%s, mismatch",
+			s.boundZoneId, zoneId)
+	}
+	return nil
+}
+
+func (s *sidecarService) bindZoneId(zoneId string) {
+	s.boundZoneId = zoneId
+}
+
+func (s *sidecarService) unbindZoneId() {
+	s.boundZoneId = ""
 }
 
 func (s *sidecarService) doReload(reloadCh chan chan error) error {

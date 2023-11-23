@@ -39,7 +39,7 @@ import (
 	"github.com/prometheus/prometheus/util/testutil"
 )
 
-func TestSidecarAPI(t *testing.T) {
+func TestSidecarAPI_update_config(t *testing.T) {
 	t.Parallel()
 
 	dbDir := t.TempDir()
@@ -103,6 +103,7 @@ func TestSidecarAPI(t *testing.T) {
 
 	baseURL := "http://localhost" + port
 	cmdJson := `{
+    "zone_id": "default",
     "yaml": "global:\n  scrape_interval: 15s\n  scrape_timeout: 10s\n  evaluation_interval: 15s\nalerting:\n  alertmanagers:\n  - follow_redirects: true\n    enable_http2: true\n    scheme: http\n    timeout: 10s\n    api_version: v2\n    static_configs:\n    - targets: []\nscrape_configs:\n- job_name: prometheus\n  honor_timestamps: true\n  scrape_interval: 15s\n  scrape_timeout: 10s\n  metrics_path: /metrics\n  scheme: http\n  follow_redirects: true\n  enable_http2: true\n  static_configs:\n  - targets:\n    - localhost:9090\n",
     "rule_files": [
         {
@@ -141,7 +142,7 @@ func TestSidecarAPI(t *testing.T) {
 	cleanupTestResponse(t, resp)
 }
 
-func TestSidecarAPI2(t *testing.T) {
+func TestSidecarAPI_last_update_ts(t *testing.T) {
 	t.Parallel()
 
 	dbDir := t.TempDir()
@@ -228,5 +229,93 @@ func TestSidecarAPI2(t *testing.T) {
 	all, err = io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	logger.Log("resp", all)
+	cleanupTestResponse(t, resp)
+}
+
+func TestSidecarAPI_reset_config(t *testing.T) {
+	t.Parallel()
+
+	dbDir := t.TempDir()
+
+	db, err := tsdb.Open(dbDir, nil, nil, nil, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, db.Close())
+	})
+	port := fmt.Sprintf(":%d", testutil.RandomUnprivilegedPort(t))
+
+	opts := &Options{
+		ListenAddress:   port,
+		ReadTimeout:     30 * time.Second,
+		MaxConnections:  512,
+		Context:         nil,
+		Storage:         nil,
+		LocalStorage:    &dbAdapter{db},
+		TSDBDir:         dbDir,
+		QueryEngine:     nil,
+		ScrapeManager:   &scrape.Manager{},
+		RuleManager:     &rules.Manager{},
+		Notifier:        nil,
+		RoutePrefix:     "/",
+		EnableAdminAPI:  true,
+		EnableLifecycle: true,
+		ExternalURL: &url.URL{
+			Scheme: "http",
+			Host:   "localhost" + port,
+			Path:   "/",
+		},
+		Version:  &PrometheusVersion{},
+		Gatherer: prometheus.DefaultGatherer,
+	}
+
+	opts.Flags = map[string]string{}
+
+	logger := log.NewLogfmtLogger(os.Stdout)
+	sidecarSvc := sidecar.New(logger, "../test-data/prometheus.yml")
+	webHandler := New(logger, opts, sidecarSvc)
+
+	webHandler.config = &config.Config{}
+	webHandler.notifier = &notifier.Manager{}
+	l, err := webHandler.Listener()
+	if err != nil {
+		panic(fmt.Sprintf("Unable to start web listener: %s", err))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		err := webHandler.Run(ctx, l, "")
+		if err != nil {
+			panic(fmt.Sprintf("Can't start web handler:%s", err))
+		}
+	}()
+
+	// Give some time for the web goroutine to run since we need the server
+	// to be up before starting tests.
+	time.Sleep(5 * time.Second)
+
+	baseURL := "http://localhost" + port
+	cmdJson := `{"zone_id": "default"}`
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/-/sidecar/reset-config", strings.NewReader(cmdJson))
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	cleanupTestResponse(t, resp)
+
+	// Set to ready.
+	webHandler.SetReady(true)
+
+	go func() {
+		rc := <-webHandler.Reload()
+		rc <- nil
+	}()
+
+	req, err = http.NewRequest(http.MethodPost, baseURL+"/-/sidecar/reset-config", strings.NewReader(cmdJson))
+	require.NoError(t, err)
+	resp, err = http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
 	cleanupTestResponse(t, resp)
 }

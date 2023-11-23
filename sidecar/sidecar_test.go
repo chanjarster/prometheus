@@ -263,9 +263,9 @@ func Test_sidecarService_UpdateConfigReload(t *testing.T) {
 	require.NoError(t, err)
 
 	// 预先准备一些文件
+	require.NoError(t, os.WriteFile(configFile, templateConfigYaml, 0o666))
 	require.NoError(t, os.MkdirAll(filepath.Join(testDir, "secrets"), 0o777))
 	require.NoError(t, os.MkdirAll(filepath.Join(testDir, "rules"), 0o777))
-	require.NoError(t, os.WriteFile(configFile, templateConfigYaml, 0o666))
 	require.NoError(t, os.WriteFile(filepath.Join(testDir, "secrets", "secret-a"), []byte("secret-a"), 0o666))
 	require.NoError(t, os.WriteFile(filepath.Join(testDir, "secrets", "secret-b"), []byte("secret-b"), 0o666))
 	require.NoError(t, os.WriteFile(filepath.Join(testDir, "rules", "rules-a"), []byte("rules-a"), 0o666))
@@ -276,10 +276,37 @@ func Test_sidecarService_UpdateConfigReload(t *testing.T) {
 		configFile: configFile,
 	}
 
-	require.Equal(t, time.Time{}, s.GetLastUpdateTs())
+	boundZoneId, ts := s.GetLastUpdateTs()
+	require.Equal(t, "", boundZoneId)
+	require.Equal(t, time.Time{}, ts)
 
 	cmd := &UpdateConfigCmd{
-		Yaml: "global:\n  scrape_interval: 15s\n  scrape_timeout: 10s\n  evaluation_interval: 15s\nalerting:\n  alertmanagers:\n  - follow_redirects: true\n    enable_http2: true\n    scheme: http\n    timeout: 10s\n    api_version: v2\n    static_configs:\n    - targets: []\nscrape_configs:\n- job_name: prometheus\n  honor_timestamps: true\n  scrape_interval: 15s\n  scrape_timeout: 10s\n  metrics_path: /metrics\n  scheme: http\n  follow_redirects: true\n  enable_http2: true\n  static_configs:\n  - targets:\n    - localhost:9090\n",
+		ZoneId: "default",
+		Yaml: `global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+alerting:
+  alertmanagers:
+  - follow_redirects: true
+    enable_http2: true
+    scheme: http
+    timeout: 10s
+    api_version: v2
+    static_configs:
+    - targets: []
+scrape_configs:
+- job_name: prometheus
+  honor_timestamps: true
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  metrics_path: /metrics
+  scheme: http
+  follow_redirects: true
+  enable_http2: true
+  static_configs:
+  - targets:
+    - localhost:9090`,
 		RuleFiles: []ruleFileInner{
 			{FileName: "foo", Yaml: "groups: []"},
 			{FileName: "bar", Yaml: "groups: []"},
@@ -297,8 +324,18 @@ func Test_sidecarService_UpdateConfigReload(t *testing.T) {
 	}()
 	err = s.UpdateConfigReload(context.TODO(), cmd, reloadCh)
 	require.NoError(t, err)
-	require.NotEqual(t, time.Time{}, s.GetLastUpdateTs())
 
+	// 绑定的 zoneId 变更了，更新时间戳也变了
+	boundZoneId, ts = s.GetLastUpdateTs()
+	require.Equal(t, cmd.ZoneId, boundZoneId)
+	require.NotEqual(t, time.Time{}, ts)
+
+	// 配置文件写入了
+	configFileB, err := os.ReadFile(configFile)
+	require.NoError(t, err)
+	require.NotEqual(t, templateConfigYaml, configFileB)
+
+	// 其他文件也写入了，旧的相关文件被删除了
 	require.FileExists(t, filepath.Join(testDir, "secrets", "secret-foo"))
 	require.FileExists(t, filepath.Join(testDir, "secrets", "secret-bar"))
 	require.FileExists(t, filepath.Join(testDir, "rules", "rules-foo"))
@@ -308,6 +345,101 @@ func Test_sidecarService_UpdateConfigReload(t *testing.T) {
 	require.NoFileExists(t, filepath.Join(testDir, "secrets", "secret-b"))
 	require.NoFileExists(t, filepath.Join(testDir, "rules", "rules-a"))
 	require.NoFileExists(t, filepath.Join(testDir, "rules", "rules-b"))
+}
+
+func Test_sidecarService_UpdateConfigReload_ZoneIdMismatch(t *testing.T) {
+	testDir, err := os.MkdirTemp("", "prom-config")
+	require.NoError(t, err)
+	fmt.Println("test dir:", testDir)
+	defer os.RemoveAll(testDir)
+
+	configFile := filepath.Join(testDir, "prometheus.yml")
+	templateConfigYaml, err := os.ReadFile("../test-data/prometheus.yml")
+	require.NoError(t, err)
+
+	// 预先准备一些文件
+	require.NoError(t, os.WriteFile(configFile, templateConfigYaml, 0o666))
+	require.NoError(t, os.MkdirAll(filepath.Join(testDir, "secrets"), 0o777))
+	require.NoError(t, os.MkdirAll(filepath.Join(testDir, "rules"), 0o777))
+
+	s := &sidecarService{
+		logger:     log.NewLogfmtLogger(os.Stdout),
+		configFile: configFile,
+	}
+
+	{
+		// 先做一次更新
+		cmd := &UpdateConfigCmd{
+			ZoneId: "default",
+			Yaml:   "global:\n  scrape_interval: 15s\n  scrape_timeout: 10s\n  evaluation_interval: 15s\nalerting:\n  alertmanagers:\n  - follow_redirects: true\n    enable_http2: true\n    scheme: http\n    timeout: 10s\n    api_version: v2\n    static_configs:\n    - targets: []\nscrape_configs:\n- job_name: prometheus\n  honor_timestamps: true\n  scrape_interval: 15s\n  scrape_timeout: 10s\n  metrics_path: /metrics\n  scheme: http\n  follow_redirects: true\n  enable_http2: true\n  static_configs:\n  - targets:\n    - localhost:9090\n",
+			RuleFiles: []ruleFileInner{
+				{FileName: "foo", Yaml: "groups: []"},
+				{FileName: "bar", Yaml: "groups: []"},
+			},
+			SecretFiles: []secretFileInner{
+				{FileName: "foo", Secret: "bar"},
+				{FileName: "bar", Secret: "blah blah"},
+			},
+		}
+
+		reloadCh := make(chan chan error)
+		go func() {
+			ch := <-reloadCh
+			ch <- nil
+		}()
+		err = s.UpdateConfigReload(context.TODO(), cmd, reloadCh)
+		require.NoError(t, err)
+		boundZoneId, ts := s.GetLastUpdateTs()
+		require.Equal(t, "default", boundZoneId)
+		require.NotEqual(t, time.Time{}, ts)
+	}
+
+	{
+		lastBoundZoneId, lastTs := s.GetLastUpdateTs()
+		lastConfigFileB, err := os.ReadFile(configFile)
+		require.NoError(t, err)
+
+		// 下达一个 zoneId 不匹配的指令
+		cmd2 := &UpdateConfigCmd{
+			ZoneId: "default2",
+			Yaml:   "global:\n  scrape_interval: 15s\n  scrape_timeout: 10s\n  evaluation_interval: 15s\nalerting:\n  alertmanagers:\n  - follow_redirects: true\n    enable_http2: true\n    scheme: http\n    timeout: 10s\n    api_version: v2\n    static_configs:\n    - targets: []\nscrape_configs:\n- job_name: prometheus\n  honor_timestamps: true\n  scrape_interval: 15s\n  scrape_timeout: 10s\n  metrics_path: /metrics\n  scheme: http\n  follow_redirects: true\n  enable_http2: true\n  static_configs:\n  - targets:\n    - localhost:9090\n",
+			RuleFiles: []ruleFileInner{
+				{FileName: "foo2", Yaml: "groups: []"},
+				{FileName: "bar2", Yaml: "groups: []"},
+			},
+			SecretFiles: []secretFileInner{
+				{FileName: "foo2", Secret: "bar"},
+				{FileName: "bar2", Secret: "blah blah"},
+			},
+		}
+
+		reloadCh := make(chan chan error)
+		go func() {
+			ch := <-reloadCh
+			ch <- nil
+		}()
+		err = s.UpdateConfigReload(context.TODO(), cmd2, reloadCh)
+		require.Error(t, err)
+
+		thisBoundZoneId, thisTs := s.GetLastUpdateTs()
+		// 配置绑定 zoneId 没有变更，时间戳也没变
+		require.Equal(t, lastBoundZoneId, thisBoundZoneId)
+		require.Equal(t, lastTs, thisTs)
+		// 配置文件也没有变更
+		thisConfigFileB, err := os.ReadFile(configFile)
+		require.NoError(t, err)
+		require.Equal(t, lastConfigFileB, thisConfigFileB)
+
+		require.FileExists(t, filepath.Join(testDir, "secrets", "secret-foo"))
+		require.FileExists(t, filepath.Join(testDir, "secrets", "secret-bar"))
+		require.FileExists(t, filepath.Join(testDir, "rules", "rules-foo"))
+		require.FileExists(t, filepath.Join(testDir, "rules", "rules-bar"))
+
+		require.NoFileExists(t, filepath.Join(testDir, "secrets", "secret-foo2"))
+		require.NoFileExists(t, filepath.Join(testDir, "secrets", "secret-bar2"))
+		require.NoFileExists(t, filepath.Join(testDir, "rules", "rules-foo2"))
+		require.NoFileExists(t, filepath.Join(testDir, "rules", "rules-bar2"))
+	}
 }
 
 func Test_sidecarService_UpdateConfigReload_ErrorRestore(t *testing.T) {
@@ -321,9 +453,9 @@ func Test_sidecarService_UpdateConfigReload_ErrorRestore(t *testing.T) {
 	require.NoError(t, err)
 
 	// 预先准备一些文件
+	require.NoError(t, os.WriteFile(configFile, templateConfigYaml, 0o666))
 	require.NoError(t, os.MkdirAll(filepath.Join(testDir, "secrets"), 0o777))
 	require.NoError(t, os.MkdirAll(filepath.Join(testDir, "rules"), 0o777))
-	require.NoError(t, os.WriteFile(configFile, templateConfigYaml, 0o666))
 	require.NoError(t, os.WriteFile(filepath.Join(testDir, "secrets", "secret-a"), []byte("secret-a"), 0o666))
 	require.NoError(t, os.WriteFile(filepath.Join(testDir, "secrets", "secret-b"), []byte("secret-b"), 0o666))
 	require.NoError(t, os.WriteFile(filepath.Join(testDir, "rules", "rules-a"), []byte("rules-a"), 0o666))
@@ -334,10 +466,13 @@ func Test_sidecarService_UpdateConfigReload_ErrorRestore(t *testing.T) {
 		configFile: configFile,
 	}
 
-	require.Equal(t, time.Time{}, s.GetLastUpdateTs())
+	boundZoneId, ts := s.GetLastUpdateTs()
+	require.Equal(t, "", boundZoneId)
+	require.Equal(t, time.Time{}, ts)
 
 	cmd := &UpdateConfigCmd{
-		Yaml: "global:\n  scrape_interval: 15s\n  scrape_timeout: 10s\n  evaluation_interval: 15s\nalerting:\n  alertmanagers:\n  - follow_redirects: true\n    enable_http2: true\n    scheme: http\n    timeout: 10s\n    api_version: v2\n    static_configs:\n    - targets: []\nscrape_configs:\n- job_name: prometheus\n  honor_timestamps: true\n  scrape_interval: 15s\n  scrape_timeout: 10s\n  metrics_path: /metrics\n  scheme: http\n  follow_redirects: true\n  enable_http2: true\n  static_configs:\n  - targets:\n    - localhost:9090\n",
+		ZoneId: "default",
+		Yaml:   "global:\n  scrape_interval: 15s\n  scrape_timeout: 10s\n  evaluation_interval: 15s\nalerting:\n  alertmanagers:\n  - follow_redirects: true\n    enable_http2: true\n    scheme: http\n    timeout: 10s\n    api_version: v2\n    static_configs:\n    - targets: []\nscrape_configs:\n- job_name: prometheus\n  honor_timestamps: true\n  scrape_interval: 15s\n  scrape_timeout: 10s\n  metrics_path: /metrics\n  scheme: http\n  follow_redirects: true\n  enable_http2: true\n  static_configs:\n  - targets:\n    - localhost:9090\n",
 		RuleFiles: []ruleFileInner{
 			{FileName: "foo", Yaml: "groups: []"},
 			{FileName: "bar", Yaml: "groups: []"},
@@ -356,12 +491,17 @@ func Test_sidecarService_UpdateConfigReload_ErrorRestore(t *testing.T) {
 	err = s.UpdateConfigReload(context.TODO(), cmd, reloadCh)
 	require.Error(t, err)
 
+	// 绑定的 zoneId 依然是空，时间戳也是空
+	boundZoneId, ts = s.GetLastUpdateTs()
+	require.Equal(t, "", boundZoneId)
+	require.Equal(t, time.Time{}, ts)
+
+	// 配置文件没有变更
 	configFileYaml, err := os.ReadFile(configFile)
 	require.NoError(t, err)
 	require.Equal(t, templateConfigYaml, configFileYaml)
 
-	require.Equal(t, time.Time{}, s.GetLastUpdateTs())
-
+	// 原来的文件都在，新的文件没有写入
 	require.NoFileExists(t, filepath.Join(testDir, "secrets", "secret-foo"))
 	require.NoFileExists(t, filepath.Join(testDir, "secrets", "secret-bar"))
 	require.NoFileExists(t, filepath.Join(testDir, "rules", "rules-foo"))
@@ -371,4 +511,101 @@ func Test_sidecarService_UpdateConfigReload_ErrorRestore(t *testing.T) {
 	require.FileExists(t, filepath.Join(testDir, "secrets", "secret-b"))
 	require.FileExists(t, filepath.Join(testDir, "rules", "rules-a"))
 	require.FileExists(t, filepath.Join(testDir, "rules", "rules-b"))
+}
+
+func Test_sidecarService_ResetConfigReload(t *testing.T) {
+	testDir, err := os.MkdirTemp("", "prom-config")
+	require.NoError(t, err)
+	fmt.Println("test dir:", testDir)
+	defer os.RemoveAll(testDir)
+
+	configFile := filepath.Join(testDir, "prometheus.yml")
+	templateConfigYaml, err := os.ReadFile("../test-data/prometheus.yml")
+	require.NoError(t, err)
+
+	require.NoError(t, os.WriteFile(configFile, templateConfigYaml, 0o666))
+
+	s := &sidecarService{
+		logger:     log.NewLogfmtLogger(os.Stdout),
+		configFile: configFile,
+	}
+
+	t.Run("reset origin empty", func(t *testing.T) {
+		reloadCh := make(chan chan error)
+		go func() {
+			ch := <-reloadCh
+			ch <- nil
+		}()
+
+		err = s.ResetConfigReload(context.TODO(), "default", reloadCh)
+		require.NoError(t, err)
+
+		boundZoneId, ts := s.GetLastUpdateTs()
+		require.Equal(t, "", boundZoneId)
+		require.Equal(t, time.Time{}, ts)
+	})
+
+	t.Run("reset configured", func(t *testing.T) {
+		cmd := &UpdateConfigCmd{
+			ZoneId: "default",
+			Yaml:   "global:\n  scrape_interval: 15s\n  scrape_timeout: 10s\n  evaluation_interval: 15s\nalerting:\n  alertmanagers:\n  - follow_redirects: true\n    enable_http2: true\n    scheme: http\n    timeout: 10s\n    api_version: v2\n    static_configs:\n    - targets: []\nscrape_configs:\n- job_name: prometheus\n  honor_timestamps: true\n  scrape_interval: 15s\n  scrape_timeout: 10s\n  metrics_path: /metrics\n  scheme: http\n  follow_redirects: true\n  enable_http2: true\n  static_configs:\n  - targets:\n    - localhost:9090\n",
+			RuleFiles: []ruleFileInner{
+				{FileName: "foo", Yaml: "groups: []"},
+				{FileName: "bar", Yaml: "groups: []"},
+			},
+			SecretFiles: []secretFileInner{
+				{FileName: "foo", Secret: "bar"},
+				{FileName: "bar", Secret: "blah blah"},
+			},
+		}
+
+		{
+			reloadCh := make(chan chan error)
+			go func() {
+				ch := <-reloadCh
+				ch <- nil
+			}()
+			require.NoError(t, s.UpdateConfigReload(context.TODO(), cmd, reloadCh))
+		}
+
+		reloadCh := make(chan chan error)
+		go func() {
+			ch := <-reloadCh
+			ch <- nil
+		}()
+		err = s.ResetConfigReload(context.TODO(), "default", reloadCh)
+		require.NoError(t, err)
+
+		thisBoundZoneId, thisTs := s.GetLastUpdateTs()
+		// 配置 zoneId 没有变更，但是时间戳重置了
+		require.Equal(t, "default", thisBoundZoneId)
+		require.Equal(t, time.Time{}, thisTs)
+
+		// 文件都消失了
+		require.NoFileExists(t, filepath.Join(testDir, "secrets", "secret-foo"))
+		require.NoFileExists(t, filepath.Join(testDir, "secrets", "secret-bar"))
+		require.NoFileExists(t, filepath.Join(testDir, "rules", "rules-foo"))
+		require.NoFileExists(t, filepath.Join(testDir, "rules", "rules-bar"))
+
+		configFileYamlB, err2 := os.ReadFile(configFile)
+		require.NoError(t, err2)
+
+		require.YAMLEq(t, emptyCfgYaml, string(configFileYamlB))
+	})
+}
+
+func Test_sidecarService_unbindZoneId(t *testing.T) {
+	tests := []struct {
+		name string
+	}{
+		// TODO: Add test cases.
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &sidecarService{
+				logger: log.NewLogfmtLogger(os.Stdout),
+			}
+			s.unbindZoneId()
+		})
+	}
 }
