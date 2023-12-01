@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.47.2-mod.4 / 2023-12-05
+
+* [ENHANCEMENT] Remove API for get last update timestamp.
+* [ENHANCEMENT] add API for get runtime info.
+* [ENHANCEMENT] Add API for test scrape config on the fly.
+* [ENHANCEMENT] Add API for test scrape config in the configuration file.
+* [ENHANCEMENT] Add API for test remote write config on the fly.
+* [ENHANCEMENT] Add API for test remote write config in the configuration file.
+
 ## 2.47.2-mod.3 / 2023-11-23
 
 * [ENHANCEMENT] Check ZoneId when update configuration

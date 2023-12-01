@@ -7,6 +7,8 @@ describe('Status', () => {
   describe('Snapshot testing', () => {
     const response: any = [
       {
+        sidecarZoneId: 'mystery',
+        sidecarLastUpdateTs: '2019-10-30T22:03:23.247913868+02:00',
         startTime: '2019-10-30T22:03:23.247913868+02:00',
         CWD: '/home/boyskila/Desktop/prometheus',
         reloadConfigSuccess: true,

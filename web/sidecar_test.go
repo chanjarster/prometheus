@@ -20,9 +20,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/prometheus/prometheus/discovery"
 
 	"github.com/go-kit/log"
 
@@ -42,60 +45,10 @@ import (
 func TestSidecarAPI_update_config(t *testing.T) {
 	t.Parallel()
 
-	dbDir := t.TempDir()
-
-	db, err := tsdb.Open(dbDir, nil, nil, nil, nil)
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		require.NoError(t, db.Close())
-	})
-	port := fmt.Sprintf(":%d", testutil.RandomUnprivilegedPort(t))
-
-	opts := &Options{
-		ListenAddress:   port,
-		ReadTimeout:     30 * time.Second,
-		MaxConnections:  512,
-		Context:         nil,
-		Storage:         nil,
-		LocalStorage:    &dbAdapter{db},
-		TSDBDir:         dbDir,
-		QueryEngine:     nil,
-		ScrapeManager:   &scrape.Manager{},
-		RuleManager:     &rules.Manager{},
-		Notifier:        nil,
-		RoutePrefix:     "/",
-		EnableAdminAPI:  true,
-		EnableLifecycle: true,
-		ExternalURL: &url.URL{
-			Scheme: "http",
-			Host:   "localhost" + port,
-			Path:   "/",
-		},
-		Version:  &PrometheusVersion{},
-		Gatherer: prometheus.DefaultGatherer,
-	}
-
-	opts.Flags = map[string]string{}
-
-	logger := log.NewLogfmtLogger(os.Stdout)
-	sidecarSvc := sidecar.New(logger, "../test-data/prometheus.yml")
-	webHandler := New(logger, opts, sidecarSvc)
-
-	webHandler.config = &config.Config{}
-	webHandler.notifier = &notifier.Manager{}
-	l, err := webHandler.Listener()
-	if err != nil {
-		panic(fmt.Sprintf("Unable to start web listener: %s", err))
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() {
-		err := webHandler.Run(ctx, l, "")
-		if err != nil {
-			panic(fmt.Sprintf("Can't start web handler:%s", err))
-		}
-	}()
+	webHandler, port := startWebHandler(t, ctx)
+	logger := log.NewLogfmtLogger(os.Stdout)
 
 	// Give some time for the web goroutine to run since we need the server
 	// to be up before starting tests.
@@ -123,7 +76,11 @@ func TestSidecarAPI_update_config(t *testing.T) {
 	require.NoError(t, err)
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
+	all, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, logger.Log("resp", all))
 	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	require.Equal(t, "application/json; charset=utf-8", resp.Header.Get("Content-Type"))
 	cleanupTestResponse(t, resp)
 
 	// Set to ready.
@@ -138,67 +95,21 @@ func TestSidecarAPI_update_config(t *testing.T) {
 	require.NoError(t, err)
 	resp, err = http.DefaultClient.Do(req)
 	require.NoError(t, err)
+	all, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, logger.Log("resp", all))
 	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "application/json; charset=utf-8", resp.Header.Get("Content-Type"))
 	cleanupTestResponse(t, resp)
 }
 
-func TestSidecarAPI_last_update_ts(t *testing.T) {
+func TestSidecarAPI_get_runtimeinfo(t *testing.T) {
 	t.Parallel()
-
-	dbDir := t.TempDir()
-
-	db, err := tsdb.Open(dbDir, nil, nil, nil, nil)
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		require.NoError(t, db.Close())
-	})
-	port := fmt.Sprintf(":%d", testutil.RandomUnprivilegedPort(t))
-
-	opts := &Options{
-		ListenAddress:   port,
-		ReadTimeout:     30 * time.Second,
-		MaxConnections:  512,
-		Context:         nil,
-		Storage:         nil,
-		LocalStorage:    &dbAdapter{db},
-		TSDBDir:         dbDir,
-		QueryEngine:     nil,
-		ScrapeManager:   &scrape.Manager{},
-		RuleManager:     &rules.Manager{},
-		Notifier:        nil,
-		RoutePrefix:     "/",
-		EnableAdminAPI:  true,
-		EnableLifecycle: true,
-		ExternalURL: &url.URL{
-			Scheme: "http",
-			Host:   "localhost" + port,
-			Path:   "/",
-		},
-		Version:  &PrometheusVersion{},
-		Gatherer: prometheus.DefaultGatherer,
-	}
-
-	opts.Flags = map[string]string{}
-
-	logger := log.NewLogfmtLogger(os.Stdout)
-	sidecarSvc := sidecar.New(logger, "../test-data/prometheus.yml")
-	webHandler := New(logger, opts, sidecarSvc)
-
-	webHandler.config = &config.Config{}
-	webHandler.notifier = &notifier.Manager{}
-	l, err := webHandler.Listener()
-	if err != nil {
-		panic(fmt.Sprintf("Unable to start web listener: %s", err))
-	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() {
-		err := webHandler.Run(ctx, l, "")
-		if err != nil {
-			panic(fmt.Sprintf("Can't start web handler:%s", err))
-		}
-	}()
+	webHandler, port := startWebHandler(t, ctx)
+	logger := log.NewLogfmtLogger(os.Stdout)
 
 	// Give some time for the web goroutine to run since we need the server
 	// to be up before starting tests.
@@ -206,12 +117,13 @@ func TestSidecarAPI_last_update_ts(t *testing.T) {
 
 	baseURL := "http://localhost" + port
 
-	resp, err := http.Get(baseURL + "/-/sidecar/last-update-ts")
+	resp, err := http.Get(baseURL + "/-/sidecar/runtimeinfo")
 	require.NoError(t, err)
-	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
 	all, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	logger.Log("resp", all)
+	require.NoError(t, logger.Log("resp", all))
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	require.Equal(t, "application/json; charset=utf-8", resp.Header.Get("Content-Type"))
 	cleanupTestResponse(t, resp)
 
 	// Set to ready.
@@ -222,73 +134,23 @@ func TestSidecarAPI_last_update_ts(t *testing.T) {
 		rc <- nil
 	}()
 
-	resp, err = http.Get(baseURL + "/-/sidecar/last-update-ts")
+	resp, err = http.Get(baseURL + "/-/sidecar/runtimeinfo")
 	require.NoError(t, err)
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	require.Equal(t, "application/json; charset=utf-8", resp.Header.Get("Content-Type"))
 	all, err = io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	logger.Log("resp", all)
+	require.NoError(t, logger.Log("resp", all))
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "application/json; charset=utf-8", resp.Header.Get("Content-Type"))
 	cleanupTestResponse(t, resp)
 }
 
 func TestSidecarAPI_reset_config(t *testing.T) {
 	t.Parallel()
 
-	dbDir := t.TempDir()
-
-	db, err := tsdb.Open(dbDir, nil, nil, nil, nil)
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		require.NoError(t, db.Close())
-	})
-	port := fmt.Sprintf(":%d", testutil.RandomUnprivilegedPort(t))
-
-	opts := &Options{
-		ListenAddress:   port,
-		ReadTimeout:     30 * time.Second,
-		MaxConnections:  512,
-		Context:         nil,
-		Storage:         nil,
-		LocalStorage:    &dbAdapter{db},
-		TSDBDir:         dbDir,
-		QueryEngine:     nil,
-		ScrapeManager:   &scrape.Manager{},
-		RuleManager:     &rules.Manager{},
-		Notifier:        nil,
-		RoutePrefix:     "/",
-		EnableAdminAPI:  true,
-		EnableLifecycle: true,
-		ExternalURL: &url.URL{
-			Scheme: "http",
-			Host:   "localhost" + port,
-			Path:   "/",
-		},
-		Version:  &PrometheusVersion{},
-		Gatherer: prometheus.DefaultGatherer,
-	}
-
-	opts.Flags = map[string]string{}
-
-	logger := log.NewLogfmtLogger(os.Stdout)
-	sidecarSvc := sidecar.New(logger, "../test-data/prometheus.yml")
-	webHandler := New(logger, opts, sidecarSvc)
-
-	webHandler.config = &config.Config{}
-	webHandler.notifier = &notifier.Manager{}
-	l, err := webHandler.Listener()
-	if err != nil {
-		panic(fmt.Sprintf("Unable to start web listener: %s", err))
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() {
-		err := webHandler.Run(ctx, l, "")
-		if err != nil {
-			panic(fmt.Sprintf("Can't start web handler:%s", err))
-		}
-	}()
+	webHandler, port := startWebHandler(t, ctx)
+	logger := log.NewLogfmtLogger(os.Stdout)
 
 	// Give some time for the web goroutine to run since we need the server
 	// to be up before starting tests.
@@ -301,7 +163,11 @@ func TestSidecarAPI_reset_config(t *testing.T) {
 	require.NoError(t, err)
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
+	all, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, logger.Log("resp", all))
 	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	require.Equal(t, "application/json; charset=utf-8", resp.Header.Get("Content-Type"))
 	cleanupTestResponse(t, resp)
 
 	// Set to ready.
@@ -316,6 +182,272 @@ func TestSidecarAPI_reset_config(t *testing.T) {
 	require.NoError(t, err)
 	resp, err = http.DefaultClient.Do(req)
 	require.NoError(t, err)
+	all, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, logger.Log("resp", all))
 	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "application/json; charset=utf-8", resp.Header.Get("Content-Type"))
 	cleanupTestResponse(t, resp)
+}
+
+func TestSidecarAPI_test_scrape_config(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	webHandler, port := startWebHandler(t, ctx)
+	logger := log.NewLogfmtLogger(os.Stdout)
+
+	// Give some time for the web goroutine to run since we need the server
+	// to be up before starting tests.
+	time.Sleep(5 * time.Second)
+
+	baseURL := "http://localhost" + port
+	cmdJson := `{"yaml":"job_name: test\nstatic_configs:\n  - targets:\n      - localhost:555"}`
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/-/sidecar/test/scrape-config", strings.NewReader(cmdJson))
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	all, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	logger.Log("resp", all)
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	require.Equal(t, "application/json; charset=utf-8", resp.Header.Get("Content-Type"))
+	cleanupTestResponse(t, resp)
+
+	// Set to ready.
+	webHandler.SetReady(true)
+
+	go func() {
+		rc := <-webHandler.Reload()
+		rc <- nil
+	}()
+
+	req, err = http.NewRequest(http.MethodPost, baseURL+"/-/sidecar/test/scrape-config", strings.NewReader(cmdJson))
+	require.NoError(t, err)
+	resp, err = http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	all, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, logger.Log("resp", all))
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "application/json; charset=utf-8", resp.Header.Get("Content-Type"))
+	cleanupTestResponse(t, resp)
+}
+
+func TestSidecarAPI_test_scrape_jobs(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	webHandler, port := startWebHandler(t, ctx)
+	logger := log.NewLogfmtLogger(os.Stdout)
+
+	// Give some time for the web goroutine to run since we need the server
+	// to be up before starting tests.
+	time.Sleep(5 * time.Second)
+
+	baseURL := "http://localhost" + port
+	cmdJson := `{"job_names":["test"]}`
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/-/sidecar/test/scrape-jobs", strings.NewReader(cmdJson))
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	all, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, logger.Log("resp", all))
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	require.Equal(t, "application/json; charset=utf-8", resp.Header.Get("Content-Type"))
+	cleanupTestResponse(t, resp)
+
+	// Set to ready.
+	webHandler.SetReady(true)
+
+	go func() {
+		rc := <-webHandler.Reload()
+		rc <- nil
+	}()
+
+	req, err = http.NewRequest(http.MethodPost, baseURL+"/-/sidecar/test/scrape-jobs", strings.NewReader(cmdJson))
+	require.NoError(t, err)
+	resp, err = http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	all, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, logger.Log("resp", all))
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "application/json; charset=utf-8", resp.Header.Get("Content-Type"))
+	cleanupTestResponse(t, resp)
+}
+
+func TestSidecarAPI_test_remote_write_config(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	webHandler, port := startWebHandler(t, ctx)
+	logger := log.NewLogfmtLogger(os.Stdout)
+
+	// Give some time for the web goroutine to run since we need the server
+	// to be up before starting tests.
+	time.Sleep(5 * time.Second)
+
+	baseURL := "http://localhost" + port
+	cmdJson := `{"yaml":"name: test\nurl: http://localhost:555"}`
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/-/sidecar/test/remote-write-config", strings.NewReader(cmdJson))
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	all, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, logger.Log("resp", all))
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	require.Equal(t, "application/json; charset=utf-8", resp.Header.Get("Content-Type"))
+	cleanupTestResponse(t, resp)
+
+	// Set to ready.
+	webHandler.SetReady(true)
+
+	go func() {
+		rc := <-webHandler.Reload()
+		rc <- nil
+	}()
+
+	req, err = http.NewRequest(http.MethodPost, baseURL+"/-/sidecar/test/remote-write-config", strings.NewReader(cmdJson))
+	require.NoError(t, err)
+	resp, err = http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	all, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, logger.Log("resp", all))
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "application/json; charset=utf-8", resp.Header.Get("Content-Type"))
+	cleanupTestResponse(t, resp)
+}
+
+func TestSidecarAPI_test_remote_write_remotes(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	webHandler, port := startWebHandler(t, ctx)
+	logger := log.NewLogfmtLogger(os.Stdout)
+
+	// Give some time for the web goroutine to run since we need the server
+	// to be up before starting tests.
+	time.Sleep(5 * time.Second)
+
+	baseURL := "http://localhost" + port
+	cmdJson := `{"remote_names":["test"]}`
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/-/sidecar/test/remote-write-remotes", strings.NewReader(cmdJson))
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	all, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, logger.Log("resp", all))
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	require.Equal(t, "application/json; charset=utf-8", resp.Header.Get("Content-Type"))
+	cleanupTestResponse(t, resp)
+
+	// Set to ready.
+	webHandler.SetReady(true)
+
+	go func() {
+		rc := <-webHandler.Reload()
+		rc <- nil
+	}()
+
+	req, err = http.NewRequest(http.MethodPost, baseURL+"/-/sidecar/test/remote-write-remotes", strings.NewReader(cmdJson))
+	require.NoError(t, err)
+	resp, err = http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	all, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, logger.Log("resp", all))
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "application/json; charset=utf-8", resp.Header.Get("Content-Type"))
+	cleanupTestResponse(t, resp)
+}
+
+func startWebHandler(t *testing.T, ctxTest context.Context) (*Handler, string) {
+	dbDir := t.TempDir()
+
+	db, err := tsdb.Open(dbDir, nil, nil, nil, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, db.Close())
+	})
+	port := fmt.Sprintf(":%d", testutil.RandomUnprivilegedPort(t))
+
+	opts := &Options{
+		ListenAddress:   port,
+		ReadTimeout:     30 * time.Second,
+		MaxConnections:  512,
+		Context:         nil,
+		Storage:         nil,
+		LocalStorage:    &dbAdapter{db},
+		TSDBDir:         dbDir,
+		QueryEngine:     nil,
+		ScrapeManager:   &scrape.Manager{},
+		RuleManager:     &rules.Manager{},
+		Notifier:        nil,
+		RoutePrefix:     "/",
+		EnableAdminAPI:  true,
+		EnableLifecycle: true,
+		ExternalURL: &url.URL{
+			Scheme: "http",
+			Host:   "localhost" + port,
+			Path:   "/",
+		},
+		Version:  &PrometheusVersion{},
+		Gatherer: prometheus.DefaultGatherer,
+	}
+
+	opts.Flags = map[string]string{}
+	scrapeOptions := &scrape.Options{
+		NoDefaultPort:             true,
+		EnableProtobufNegotiation: true,
+	}
+
+	templateConfigYaml, err := os.ReadFile("../test-data/prometheus.yml")
+	testConfigDir := t.TempDir()
+	testConfigFile := filepath.Join(testConfigDir, "prometheus.yml")
+	require.NoError(t, os.WriteFile(testConfigFile, templateConfigYaml, 0o666))
+
+	require.NoError(t, err)
+	var (
+		rootLogger           = log.NewLogfmtLogger(os.Stdout)
+		promCfg, _           = config.Load(string(templateConfigYaml), false, rootLogger)
+		discoveryManagerTest *discovery.Manager
+	)
+	discoveryManagerTest = discovery.NewManager(ctxTest, log.With(rootLogger, "component", "discovery manager test"), discovery.Name("test"))
+	go func() {
+		discoveryManagerTest.Run()
+	}()
+
+	logger := log.NewLogfmtLogger(os.Stdout)
+	sidecarSvc := sidecar.New(logger, testConfigFile, discoveryManagerTest, scrapeOptions)
+
+	webHandler := New(logger, opts, sidecarSvc)
+	webHandler.notifier = &notifier.Manager{}
+
+	l, err := webHandler.Listener()
+	if err != nil {
+		panic(fmt.Sprintf("Unable to start web listener: %s", err))
+	}
+	require.NoError(t, sidecarSvc.ApplyConfig(promCfg))
+	require.NoError(t, webHandler.ApplyConfig(promCfg))
+	go func() {
+		err := webHandler.Run(ctxTest, l, "")
+		if err != nil {
+			panic(fmt.Sprintf("Can't start web handler:%s", err))
+		}
+	}()
+
+	return webHandler, port
 }

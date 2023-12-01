@@ -15,6 +15,8 @@ export const statusConfig: Record<
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   { title?: string; customizeValue?: (v: any, key: string) => any; customRow?: boolean; skip?: boolean }
 > = {
+  sidecarZoneId: { title: 'Sidecar Zone Id' },
+  sidecarLastUpdateTs: { title: 'Sidecar last update time', customizeValue: (v: string) => new Date(v).toUTCString() },
   startTime: { title: 'Start time', customizeValue: (v: string) => new Date(v).toUTCString() },
   CWD: { title: 'Working directory' },
   reloadConfigSuccess: {

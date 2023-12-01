@@ -30,6 +30,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/prometheus/sidecar"
+
 	"github.com/prometheus/client_golang/prometheus"
 	prom_testutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
@@ -540,6 +542,7 @@ func TestAgentAPIEndPoints(t *testing.T) {
 	webHandler.SetReady(true)
 	webHandler.config = &config.Config{}
 	webHandler.notifier = &notifier.Manager{}
+	webHandler.sidecarSvc = sidecar.New(nil, "", nil, nil)
 	l, err := webHandler.Listener()
 	if err != nil {
 		panic(fmt.Sprintf("Unable to start web listener: %s", err))

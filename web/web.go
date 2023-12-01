@@ -458,10 +458,13 @@ func New(logger log.Logger, o *Options, sidecarSvc sidecar.SidecarService) *Hand
 		router.Put("/-/quit", h.quit)
 		router.Post("/-/reload", h.reload)
 		router.Put("/-/reload", h.reload)
-		router.Put("/-/sidecar/config", h.testReady(h.updateConfig))
-		router.Get("/-/sidecar/last-update-ts", h.testReady(h.getLastUpdateTs))
-		router.Post("/-/sidecar/reset-config", h.testReady(h.resetConfig))
-
+		router.Put("/-/sidecar/config", h.testSidecarReady(h.wrapSidecarApi(h.updateConfig)))
+		router.Get("/-/sidecar/runtimeinfo", h.testSidecarReady(h.wrapSidecarApi(h.getRuntimeInfo)))
+		router.Post("/-/sidecar/reset-config", h.testSidecarReady(h.wrapSidecarApi(h.resetConfig)))
+		router.Post("/-/sidecar/test/scrape-config", h.testSidecarReady(h.wrapSidecarApi(h.testScrapeConfig)))
+		router.Post("/-/sidecar/test/scrape-jobs", h.testSidecarReady(h.wrapSidecarApi(h.testScrapeJobs)))
+		router.Post("/-/sidecar/test/remote-write-config", h.testSidecarReady(h.wrapSidecarApi(h.testRemoteWriteConfig)))
+		router.Post("/-/sidecar/test/remote-write-remotes", h.testSidecarReady(h.wrapSidecarApi(h.testRemoteWriteRemotes)))
 	} else {
 		forbiddenAPINotEnabled := func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusForbidden)
@@ -471,8 +474,13 @@ func New(logger log.Logger, o *Options, sidecarSvc sidecar.SidecarService) *Hand
 		router.Put("/-/quit", forbiddenAPINotEnabled)
 		router.Post("/-/reload", forbiddenAPINotEnabled)
 		router.Put("/-/reload", forbiddenAPINotEnabled)
-		router.Put("/-/sidecar/config", forbiddenAPINotEnabled)
-		router.Get("/-/sidecar/last-update-ts", forbiddenAPINotEnabled)
+		router.Put("/-/sidecar/config", h.sidecarAPINotEnabled)
+		router.Get("/-/sidecar/runtimeinfo", h.sidecarAPINotEnabled)
+		router.Post("/-/sidecar/reset-config", h.sidecarAPINotEnabled)
+		router.Post("/-/sidecar/test/scrape-config", h.sidecarAPINotEnabled)
+		router.Post("/-/sidecar/test/scrape-jobs", h.sidecarAPINotEnabled)
+		router.Post("/-/sidecar/test/remote-write-config", h.sidecarAPINotEnabled)
+		router.Post("/-/sidecar/test/remote-write-remotes", h.sidecarAPINotEnabled)
 	}
 	router.Get("/-/quit", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -722,14 +730,17 @@ func (h *Handler) consoles(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) runtimeInfo() (api_v1.RuntimeInfo, error) {
+	rt := h.sidecarSvc.GetRuntimeInfo()
 	status := api_v1.RuntimeInfo{
-		StartTime:      h.birth,
-		CWD:            h.cwd,
-		GoroutineCount: runtime.NumGoroutine(),
-		GOMAXPROCS:     runtime.GOMAXPROCS(0),
-		GOMEMLIMIT:     debug.SetMemoryLimit(-1),
-		GOGC:           os.Getenv("GOGC"),
-		GODEBUG:        os.Getenv("GODEBUG"),
+		SidecarZoneId:       rt.ZoneId,
+		SidecarLastUpdateTs: rt.LastUpdateTs,
+		StartTime:           h.birth,
+		CWD:                 h.cwd,
+		GoroutineCount:      runtime.NumGoroutine(),
+		GOMAXPROCS:          runtime.GOMAXPROCS(0),
+		GOMEMLIMIT:          debug.SetMemoryLimit(-1),
+		GOGC:                os.Getenv("GOGC"),
+		GODEBUG:             os.Getenv("GODEBUG"),
 	}
 
 	if h.options.TSDBRetentionDuration != 0 {

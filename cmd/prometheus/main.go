@@ -709,7 +709,17 @@ func main() {
 	}
 
 	// EXTENSION: 扩展的 sidecar 功能
-	sidecarSvc := sidecar.New(log.With(logger, "component", "sidecar"), cfg.configFile)
+	var (
+		ctxTest, cancelTest  = context.WithCancel(context.Background())
+		discoveryManagerTest discoveryManager
+	)
+
+	if cfg.enableNewSDManager {
+		discoveryManagerTest = discovery.NewManager(ctxTest, log.With(logger, "component", "discovery manager test"), discovery.Name("test"))
+	} else {
+		discoveryManagerTest = legacymanager.NewManager(ctxTest, log.With(logger, "component", "discovery manager test"), legacymanager.Name("test"))
+	}
+	sidecarSvc := sidecar.New(log.With(logger, "component", "sidecar"), cfg.configFile, discoveryManagerTest, &cfg.scrape)
 
 	// Depends on cfg.web.ScrapeManager so needs to be after cfg.web.ScrapeManager = scrapeManager.
 	webHandler := web.New(log.With(logger, "component", "web"), &cfg.web, sidecarSvc)
@@ -811,6 +821,9 @@ func main() {
 		}, {
 			name:     "tracing",
 			reloader: tracingManager.ApplyConfig,
+		}, {
+			name:     "sidecar",
+			reloader: sidecarSvc.ApplyConfig,
 		},
 	}
 
@@ -886,6 +899,20 @@ func main() {
 			func(err error) {
 				level.Info(logger).Log("msg", "Stopping scrape discovery manager...")
 				cancelScrape()
+			},
+		)
+	}
+	{
+		// Test discovery manager.
+		g.Add(
+			func() error {
+				err := discoveryManagerTest.Run()
+				level.Info(logger).Log("msg", "Test discovery manager stopped")
+				return err
+			},
+			func(err error) {
+				level.Info(logger).Log("msg", "Stopping test discovery manager...")
+				cancelTest()
 			},
 		)
 	}

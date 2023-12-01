@@ -136,6 +136,8 @@ type PrometheusVersion struct {
 
 // RuntimeInfo contains runtime information about Prometheus.
 type RuntimeInfo struct {
+	SidecarZoneId       string    `json:"sidecarZoneId"`
+	SidecarLastUpdateTs time.Time `json:"sidecarLastUpdateTs"`
 	StartTime           time.Time `json:"startTime"`
 	CWD                 string    `json:"CWD"`
 	ReloadConfigSuccess bool      `json:"reloadConfigSuccess"`

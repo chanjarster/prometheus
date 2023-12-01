@@ -14,56 +14,133 @@
 package sidecar
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/gogo/protobuf/proto"
+	"github.com/golang/snappy"
+
+	"github.com/prometheus/prometheus/prompb"
+	"github.com/prometheus/prometheus/storage/remote"
+
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
-	"gopkg.in/yaml.v3"
+	config_util "github.com/prometheus/common/config"
+	"gopkg.in/yaml.v2"
 
 	p8sconfig "github.com/prometheus/prometheus/config"
+	"github.com/prometheus/prometheus/discovery"
+	"github.com/prometheus/prometheus/discovery/targetgroup"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/rulefmt"
+	"github.com/prometheus/prometheus/model/textparse"
 	_ "github.com/prometheus/prometheus/plugins" // RegisterPrivate plugins.
+	"github.com/prometheus/prometheus/scrape"
 	"github.com/prometheus/prometheus/sidecar/errs"
 	fsutil "github.com/prometheus/prometheus/sidecar/utils/fs"
 )
 
-type ruleFileInner struct {
-	FileName string `json:"filename"`
-	Yaml     string `json:"yaml"`
+type SidecarService interface {
+	// UpdateConfigReload 更新 Prometheus 配置文件
+	//  更新 Prometheus 配置文件，包括 secret 和 rule 文件
+	//  把 Prometheus 和 ZoneId 绑定（如果之前绑定过别的，则报错）
+	//  更新 “配置变更时间戳”
+	//  指示 Prometheus reload，
+	UpdateConfigReload(ctx context.Context, cmd *UpdateConfigCmd, reloadCh chan chan error) error
+
+	// GetRuntimeInfo 获得上一次更新配置文件的时间，以及绑定的 ZoneId
+	GetRuntimeInfo() *Runtimeinfo
+
+	// ResetConfigReload 恢复 Prometheus 的配置
+	//  清空所有 rules、scrape config 的配置
+	//  解绑 ZoneId
+	//  清空 “配置变更时间戳”
+	//  指示 Prometheus reload
+	ResetConfigReload(ctx context.Context, zoneId string, reloadCh chan chan error) error
+
+	// ApplyConfig 接收来自 prometheus 的最新配置
+	ApplyConfig(cfg *p8sconfig.Config) error
+
+	// TestScrapeConfig 测试 ScrapeConfig 是否正确，能否能够正常抓取指标
+	TestScrapeConfig(cmd *TestScrapeConfigCmd) (*ScrapeTestResult, error)
+
+	// TestScrapeJobs 测试 prometheus 当前配置中的 job 是否能够正常抓取指标
+	TestScrapeJobs(jobNames []string) ([]*ScrapeTestResult, error)
+
+	// TestRemoteWriteConfig 测试 RemoteWriteConfig 是否正确，能否能够正常传输数据
+	TestRemoteWriteConfig(cmd *TestRemoteWriteConfigCmd) (*RemoteWriteTestResult, error)
+
+	// TestRemoteWriteRemotes 测试 prometheus 当前配置中的 remote write 是否能够传输数据
+	TestRemoteWriteRemotes(remoteNames []string) ([]*RemoteWriteTestResult, error)
 }
 
-func (rf ruleFileInner) Validate() errs.ValidateErrors {
-	ves := make(errs.ValidateErrors, 0, 2)
-	if strings.TrimSpace(rf.FileName) == "" {
-		ves = append(ves, "Filename must not be blank")
+func New(logger log.Logger, configFile string, discoveryManager discoveryManager, scrapeOptions *scrape.Options) SidecarService {
+	if logger == nil {
+		logger = log.NewNopLogger()
 	}
-	if strings.TrimSpace(rf.Yaml) == "" {
-		ves = append(ves, "Yaml must not be blank")
+	return &sidecarService{
+		logger:           logger,
+		configFile:       configFile,
+		scrapeOptions:    scrapeOptions,
+		discoveryManager: discoveryManager,
 	}
-	return ves
 }
 
-type secretFileInner struct {
-	FileName string `json:"filename"`
-	Secret   string `json:"secret"`
+type sidecarService struct {
+	logger        log.Logger
+	configFile    string
+	scrapeOptions *scrape.Options
+
+	runtimeLock  sync.Mutex
+	boundZoneId  string    // 当前所绑定的 zoneId
+	lastUpdateTs time.Time // 上一次更新配置文件的时间戳
+
+	cfgLock sync.Mutex
+	cfg     *p8sconfig.Config // 当前 Prometheus 的配置
+
+	discoverLock     sync.Mutex
+	discoveryManager discoveryManager
 }
 
-func (sf secretFileInner) Validate() errs.ValidateErrors {
-	ves := make(errs.ValidateErrors, 0, 2)
-	if strings.TrimSpace(sf.FileName) == "" {
-		ves = append(ves, "Filename must not be blank")
+const (
+	brand = "prometheus-mod"
+)
+
+type Runtimeinfo struct {
+	Brand        string    `json:"brand"`
+	ZoneId       string    `json:"zone_id"`
+	LastUpdateTs time.Time `json:"last_update_ts"`
+}
+
+func (r *Runtimeinfo) MarshalJSON() ([]byte, error) {
+	if r == nil {
+		return []byte("null"), nil
 	}
-	if strings.TrimSpace(sf.Secret) == "" {
-		ves = append(ves, "Secret must not be blank")
+	return json.Marshal(map[string]interface{}{
+		"brand":          r.Brand,
+		"zone_id":        r.ZoneId,
+		"last_update_ts": r.LastUpdateTs.UnixMilli(),
+	})
+}
+
+func (s *sidecarService) GetRuntimeInfo() *Runtimeinfo {
+	s.runtimeLock.Lock()
+	defer s.runtimeLock.Unlock()
+	return &Runtimeinfo{
+		Brand:        brand,
+		ZoneId:       s.boundZoneId,
+		LastUpdateTs: s.lastUpdateTs,
 	}
-	return ves
 }
 
 type UpdateConfigCmd struct {
@@ -109,182 +186,49 @@ func (cmd *UpdateConfigCmd) ToPromConfig(logger log.Logger) (*p8sconfig.Config, 
 	return p8sconfig.Load(cmd.Yaml, false, logger)
 }
 
-type ResetConfigCmd struct {
-	ZoneId string `json:"zone_id"`
+func (cmd *UpdateConfigCmd) getSecretFiles() []secretFileInner {
+	return cmd.SecretFiles
 }
 
-type SidecarService interface {
-	// UpdateConfigReload 更新 Prometheus 配置文件
-	//  更新 Prometheus 配置文件，包括 secret 和 rule 文件
-	//  把 Prometheus 和 ZoneId 绑定（如之前没绑定过，否则报错）
-	//  更新 “配置变更时间戳”
-	//  指示 Prometheus reload，
-	UpdateConfigReload(ctx context.Context, cmd *UpdateConfigCmd, reloadCh chan chan error) error
-
-	// GetLastUpdateTs 获得上一次更新配置文件的时间，以及绑定的 ZoneId
-	GetLastUpdateTs() (boundZoneId string, ts time.Time)
-
-	// ResetConfigReload 恢复 Prometheus 的配置
-	//  清空所有配置
-	//  清空 “配置变更时间戳”
-	//  指示 Prometheus reload
-	ResetConfigReload(ctx context.Context, zoneId string, reloadCh chan chan error) error
+func (cmd *UpdateConfigCmd) setSecretFiles(sfs []secretFileInner) {
+	cmd.SecretFiles = sfs
 }
 
-func New(logger log.Logger, configFile string) SidecarService {
-	if logger == nil {
-		logger = log.NewNopLogger()
+type ruleFileInner struct {
+	FileName string `json:"filename"`
+	Yaml     string `json:"yaml"`
+}
+
+func (rf ruleFileInner) Validate() errs.ValidateErrors {
+	ves := make(errs.ValidateErrors, 0, 2)
+	if strings.TrimSpace(rf.FileName) == "" {
+		ves = append(ves, "Filename must not be blank")
 	}
-	return &sidecarService{
-		logger:     logger,
-		configFile: configFile,
+	if strings.TrimSpace(rf.Yaml) == "" {
+		ves = append(ves, "Yaml must not be blank")
 	}
+	return ves
 }
 
-type sidecarService struct {
-	logger       log.Logger
-	configFile   string
-	lock         sync.Mutex
-	boundZoneId  string    // 当前所绑定的 zoneId
-	lastUpdateTs time.Time // 上一次更新配置文件的时间戳
+type secretFileInner struct {
+	FileName string `json:"filename"`
+	Secret   string `json:"secret"`
 }
 
-const (
-	rulesDir          = "rules"
-	secretsDir        = "secrets"
-	ruleFilePattern   = "rules-*"
-	secretFilePattern = "secret-*"
-)
-
-func (s *sidecarService) GetLastUpdateTs() (boundZoneId string, ts time.Time) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
-	return s.boundZoneId, s.lastUpdateTs
-}
-
-// 修改 Cmd 中 RuleFile 的文件名，修改路径为 rules/rules-* ，同时返回修改后的文件名列表
-func (s *sidecarService) normalizeRuleFiles(cmd *UpdateConfigCmd) (ruleFileNames []string) {
-	ruleFileNames = make([]string, len(cmd.RuleFiles))
-	for i, rf := range cmd.RuleFiles {
-		// 去掉文件名中的特殊符号, 并修改文件名，rules-*
-		rf.FileName = "rules-" + fsutil.NormFilename(rf.FileName)
-		cmd.RuleFiles[i] = rf
-		ruleFileNames[i] = filepath.Join(rulesDir, rf.FileName)
+func (sf secretFileInner) Validate() errs.ValidateErrors {
+	ves := make(errs.ValidateErrors, 0, 2)
+	if strings.TrimSpace(sf.FileName) == "" {
+		ves = append(ves, "Filename must not be blank")
 	}
-	return ruleFileNames
-}
-
-// 更新 Prometheus Config 的 RuleFiles
-func (s *sidecarService) updatePromConfigRuleFiles(config *p8sconfig.Config, ruleFileNames []string) {
-	config.RuleFiles = ruleFileNames
-}
-
-// 修改 Cmd 中 SecretFile 的文件名，修改路径为 secrets/secret-*，同时返回 old -> new 文件名的 map
-func (s *sidecarService) normalizeSecretFiles(cmd *UpdateConfigCmd) (oldNewSecretFileName map[string]string) {
-	oldNewSecretFileName = make(map[string]string)
-	for i, sf := range cmd.SecretFiles {
-		oldName := sf.FileName
-		// 去掉文件名中的特殊符号，并修改文件名，secret-*
-		sf.FileName = "secret-" + fsutil.NormFilename(oldName)
-		cmd.SecretFiles[i] = sf
-		oldNewSecretFileName[oldName] = filepath.Join(secretsDir, sf.FileName)
+	if strings.TrimSpace(sf.Secret) == "" {
+		ves = append(ves, "Secret must not be blank")
 	}
-	return oldNewSecretFileName
-}
-
-// 更新 Prometheus Config 中所有和 Secret 有关的文件的信息
-func (s *sidecarService) updatePromConfigSecretFiles(config *p8sconfig.Config, oldNewSecretFileName map[string]string) {
-	// 更新 scrape_config.basic_auth.password_file
-	for _, scrapeConfig := range config.ScrapeConfigs {
-		if ba := scrapeConfig.HTTPClientConfig.BasicAuth; ba != nil && ba.PasswordFile != "" {
-			ba.PasswordFile = oldNewSecretFileName[ba.PasswordFile]
-		}
-	}
-	// 更新 remote_write_config.basic_auth.password_file
-	for _, rwConfig := range config.RemoteWriteConfigs {
-		if ba := rwConfig.HTTPClientConfig.BasicAuth; ba != nil && ba.PasswordFile != "" {
-			ba.PasswordFile = oldNewSecretFileName[ba.PasswordFile]
-		}
-	}
-}
-
-// 规则文件写到磁盘
-func (s *sidecarService) writeRuleFiles(ruleFiles []ruleFileInner) ([]string, error) {
-	basedir := filepath.Join(filepath.Dir(s.configFile), rulesDir)
-	fileContents := make([]fsutil.FileContent, 0, len(ruleFiles))
-	for _, rf := range ruleFiles {
-		fileContents = append(fileContents, fsutil.FileContent{Filename: rf.FileName, Content: []byte(rf.Yaml)})
-	}
-	return fsutil.WriteDirFiles(0o755, basedir, 0o644, fileContents)
-}
-
-func (s *sidecarService) backupRuleFiles() error {
-	basedir := filepath.Join(filepath.Dir(s.configFile), rulesDir)
-	return fsutil.BackupDirFiles(basedir, ruleFilePattern)
-}
-
-func (s *sidecarService) cleanBackupRuleFiles() error {
-	basedir := filepath.Join(filepath.Dir(s.configFile), rulesDir)
-	return fsutil.CleanBackupDirFiles(basedir, ruleFilePattern)
-}
-
-func (s *sidecarService) restoreRuleFiles() error {
-	basedir := filepath.Join(filepath.Dir(s.configFile), rulesDir)
-	return fsutil.RestoreDirFiles(basedir, ruleFilePattern)
-}
-
-func (s *sidecarService) writeSecretFiles(secretFiles []secretFileInner) ([]string, error) {
-	basedir := filepath.Join(filepath.Dir(s.configFile), secretsDir)
-	fileContents := make([]fsutil.FileContent, 0, len(secretFiles))
-	for _, sf := range secretFiles {
-		fileContents = append(fileContents, fsutil.FileContent{Filename: sf.FileName, Content: []byte(sf.Secret)})
-	}
-	return fsutil.WriteDirFiles(0o755, basedir, 0o644, fileContents)
-}
-
-func (s *sidecarService) backupSecretFiles() error {
-	basedir := filepath.Join(filepath.Dir(s.configFile), secretsDir)
-	return fsutil.BackupDirFiles(basedir, secretFilePattern)
-}
-
-func (s *sidecarService) restoreSecretFiles() error {
-	basedir := filepath.Join(filepath.Dir(s.configFile), secretsDir)
-	return fsutil.RestoreDirFiles(basedir, secretFilePattern)
-}
-
-func (s *sidecarService) cleanBackupSecretFiles() error {
-	basedir := filepath.Join(filepath.Dir(s.configFile), secretsDir)
-	return fsutil.CleanBackupDirFiles(basedir, secretFilePattern)
-}
-
-func (s *sidecarService) writePromConfigFile(config *p8sconfig.Config) error {
-	configYaml, err := yaml.Marshal(config)
-	if err != nil {
-		return errors.Wrap(err, "Marshal config failed")
-	}
-
-	err = os.WriteFile(s.configFile, configYaml, 0o644)
-	if err != nil {
-		return errors.Wrapf(err, "Write config file %q failed", s.configFile)
-	}
-	return nil
-}
-
-func (s *sidecarService) backupPromConfigFile() error {
-	return fsutil.BackupFile(s.configFile)
-}
-
-func (s *sidecarService) cleanBackupPromConfigFile() error {
-	return fsutil.CleanBackupFile(s.configFile)
-}
-
-func (s *sidecarService) restorePromConfigFile() error {
-	return fsutil.RestoreFile(s.configFile)
+	return ves
 }
 
 func (s *sidecarService) UpdateConfigReload(ctx context.Context, cmd *UpdateConfigCmd, reloadCh chan chan error) error {
-	s.lock.Lock()
-	defer s.lock.Unlock()
+	s.runtimeLock.Lock()
+	defer s.runtimeLock.Unlock()
 
 	verrs := cmd.Validate(s.logger)
 	if len(verrs) > 0 {
@@ -295,15 +239,17 @@ func (s *sidecarService) UpdateConfigReload(ctx context.Context, cmd *UpdateConf
 		return err
 	}
 
+	cfgFileUtil := &configFileUtil{configFile: s.configFile}
+
 	// 更新规则文件名
-	ruleFileNames := s.normalizeRuleFiles(cmd)
+	ruleFileNames := cfgFileUtil.normalizeRuleFiles(cmd)
 	// 更新 Secret 文件名
-	oldNewSecretFileName := s.normalizeSecretFiles(cmd)
+	oldNewSecretFileName := cfgFileUtil.normalizeSecretFiles(cmd)
 
 	// 更新 Prometheus 的配置文件
 	config, _ := cmd.ToPromConfig(s.logger)
-	s.updatePromConfigRuleFiles(config, ruleFileNames)
-	s.updatePromConfigSecretFiles(config, oldNewSecretFileName)
+	cfgFileUtil.updatePromConfigRuleFiles(config, ruleFileNames)
+	cfgFileUtil.updatePromConfigSecretFiles(config, oldNewSecretFileName)
 
 	var reloadErr error
 	writtenFiles := make([]string, 0, len(cmd.RuleFiles)+len(cmd.SecretFiles))
@@ -312,35 +258,36 @@ func (s *sidecarService) UpdateConfigReload(ctx context.Context, cmd *UpdateConf
 		if reloadErr == nil {
 			s.lastUpdateTs = time.Now()
 			s.bindZoneId(cmd.ZoneId)
+			_ = s.ApplyConfig(config)
 			// 没有出错
-			s.printErr(s.cleanBackupRuleFiles())
-			s.printErr(s.cleanBackupSecretFiles())
-			s.printErr(s.cleanBackupPromConfigFile())
+			s.printErr(cfgFileUtil.cleanBackupRuleFiles())
+			s.printErr(cfgFileUtil.cleanBackupSecretFiles())
+			s.printErr(cfgFileUtil.cleanBackupPromConfigFile())
 		} else {
 			// 出错了
-			s.printErr(s.restoreRuleFiles())
-			s.printErr(s.restoreSecretFiles())
-			s.printErr(s.restorePromConfigFile())
+			s.printErr(cfgFileUtil.restoreRuleFiles())
+			s.printErr(cfgFileUtil.restoreSecretFiles())
+			s.printErr(cfgFileUtil.restorePromConfigFile())
 			s.printErr(fsutil.RemoveFiles(writtenFiles))
 		}
 	}()
 
-	if reloadErr = s.backupPromConfigFile(); reloadErr != nil {
+	if reloadErr = cfgFileUtil.backupPromConfigFile(); reloadErr != nil {
 		return reloadErr
 	}
-	if reloadErr = s.backupRuleFiles(); reloadErr != nil {
+	if reloadErr = cfgFileUtil.backupRuleFiles(); reloadErr != nil {
 		return reloadErr
 	}
-	if reloadErr = s.backupSecretFiles(); reloadErr != nil {
+	if reloadErr = cfgFileUtil.backupSecretFiles(); reloadErr != nil {
 		return reloadErr
 	}
 
 	// 配置文件写到磁盘
-	if reloadErr = s.writePromConfigFile(config); reloadErr != nil {
+	if reloadErr = cfgFileUtil.writePromConfigFile(config); reloadErr != nil {
 		return reloadErr
 	}
 	// 规则文件写到磁盘
-	if wFiles, subReloadErr := s.writeRuleFiles(cmd.RuleFiles); reloadErr != nil {
+	if wFiles, subReloadErr := cfgFileUtil.writeRuleFiles(cmd.RuleFiles); subReloadErr != nil {
 		reloadErr = subReloadErr
 		writtenFiles = append(writtenFiles, wFiles...)
 		return reloadErr
@@ -348,7 +295,7 @@ func (s *sidecarService) UpdateConfigReload(ctx context.Context, cmd *UpdateConf
 		writtenFiles = append(writtenFiles, wFiles...)
 	}
 	// Secret 文件写到磁盘
-	if wFiles, subReloadErr := s.writeSecretFiles(cmd.SecretFiles); reloadErr != nil {
+	if wFiles, subReloadErr := cfgFileUtil.writeSecretFiles(cmd.SecretFiles); subReloadErr != nil {
 		reloadErr = subReloadErr
 		writtenFiles = append(writtenFiles, wFiles...)
 		return reloadErr
@@ -375,16 +322,18 @@ func (s *sidecarService) printErr(err error) {
 	}
 }
 
-const (
-	emptyCfgYaml = `global:
-  evaluation_interval: 15s
-  scrape_interval: 15s
-  scrape_timeout: 10s`
-)
+type ResetConfigCmd struct {
+	ZoneId string `json:"zone_id"`
+}
 
 func (s *sidecarService) ResetConfigReload(ctx context.Context, zoneId string, reloadCh chan chan error) error {
-	s.lock.Lock()
-	defer s.lock.Unlock()
+	cfg := s.getConfigCopy()
+	if cfg == nil {
+		return nil
+	}
+
+	s.runtimeLock.Lock()
+	defer s.runtimeLock.Unlock()
 
 	if zoneId = strings.TrimSpace(zoneId); zoneId == "" {
 		return errs.ValidateError("ZoneId must not be blank")
@@ -394,40 +343,43 @@ func (s *sidecarService) ResetConfigReload(ctx context.Context, zoneId string, r
 		return err
 	}
 
+	cfgFileUtil := &configFileUtil{configFile: s.configFile}
+
 	var reloadErr error
 
 	defer func() {
 		if reloadErr == nil {
 			s.lastUpdateTs = time.Time{}
+			s.boundZoneId = ""
+			_ = s.ApplyConfig(cfg)
 			// 没有出错
-			s.printErr(s.cleanBackupRuleFiles())
-			s.printErr(s.cleanBackupSecretFiles())
-			s.printErr(s.cleanBackupPromConfigFile())
+			s.printErr(cfgFileUtil.cleanBackupRuleFiles())
+			s.printErr(cfgFileUtil.cleanBackupSecretFiles())
+			s.printErr(cfgFileUtil.cleanBackupPromConfigFile())
 		} else {
 			// 出错了
-			s.printErr(s.restoreRuleFiles())
-			s.printErr(s.restoreSecretFiles())
-			s.printErr(s.restorePromConfigFile())
+			s.printErr(cfgFileUtil.restoreRuleFiles())
+			s.printErr(cfgFileUtil.restoreSecretFiles())
+			s.printErr(cfgFileUtil.restorePromConfigFile())
 		}
 	}()
-	if reloadErr = s.backupPromConfigFile(); reloadErr != nil {
+	if reloadErr = cfgFileUtil.backupPromConfigFile(); reloadErr != nil {
 		return reloadErr
 	}
-	if reloadErr = s.backupRuleFiles(); reloadErr != nil {
+	if reloadErr = cfgFileUtil.backupRuleFiles(); reloadErr != nil {
 		return reloadErr
 	}
-	if reloadErr = s.backupSecretFiles(); reloadErr != nil {
+	if reloadErr = cfgFileUtil.backupSecretFiles(); reloadErr != nil {
 		return reloadErr
 	}
 
-	var emptyCfg *p8sconfig.Config
-	emptyCfg, reloadErr = p8sconfig.Load(emptyCfgYaml, false, s.logger)
-	if reloadErr != nil {
-		return reloadErr
-	}
+	// 清空所有 rules、scrape config 的配置
+	cfg.ScrapeConfigs = make([]*p8sconfig.ScrapeConfig, 0)
+	cfg.ScrapeConfigFiles = make([]string, 0)
+	cfg.RuleFiles = make([]string, 0)
 
 	// 配置文件写到磁盘
-	if reloadErr = s.writePromConfigFile(emptyCfg); reloadErr != nil {
+	if reloadErr = cfgFileUtil.writePromConfigFile(cfg); reloadErr != nil {
 		return reloadErr
 	}
 
@@ -452,10 +404,6 @@ func (s *sidecarService) bindZoneId(zoneId string) {
 	s.boundZoneId = zoneId
 }
 
-func (s *sidecarService) unbindZoneId() {
-	s.boundZoneId = ""
-}
-
 func (s *sidecarService) doReload(reloadCh chan chan error) error {
 	rc := make(chan error)
 	reloadCh <- rc
@@ -463,4 +411,584 @@ func (s *sidecarService) doReload(reloadCh chan chan error) error {
 		return errors.Wrapf(err, "sidecar failed to reload config")
 	}
 	return nil
+}
+
+func (s *sidecarService) ApplyConfig(cfg *p8sconfig.Config) error {
+	s.cfgLock.Lock()
+	defer s.cfgLock.Unlock()
+	s.cfg = cfg
+	return nil
+}
+
+type testError struct {
+	err error
+}
+
+func (e *testError) MarshalJSON() ([]byte, error) {
+	if e == nil {
+		return []byte(`""`), nil
+	}
+	return json.Marshal(e.err.Error())
+}
+
+type ScrapeTestResult struct {
+	lock           sync.Mutex
+	JobName        string                `json:"job_name"`
+	Success        bool                  `json:"success"`
+	Message        string                `json:"message"`
+	Error          *testError            `json:"error,omitempty"`
+	DiscoverErrors []*testError          `json:"discover_errors,omitempty"`
+	TargetResults  []*targetScrapeResult `json:"target_results"`
+}
+
+func (r *ScrapeTestResult) append(tr *targetScrapeResult) {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	if !tr.Success {
+		r.Success = false
+		r.Message = "some target(s) failed"
+	}
+	r.TargetResults = append(r.TargetResults, tr)
+}
+
+type targetScrapeResult struct {
+	Success          bool          `json:"success"`
+	Labels           labels.Labels `json:"labels"`
+	DiscoveredLabels labels.Labels `json:"discovered_labels"`
+	Error            *testError    `json:"error"`
+}
+
+type TestScrapeJobsCmd struct {
+	JobNames []string `json:"job_names"`
+}
+
+func (s *sidecarService) TestScrapeJobs(jobNames []string) ([]*ScrapeTestResult, error) {
+	if len(jobNames) == 0 {
+		return nil, nil
+	}
+
+	config := s.getConfigCopy()
+	if config == nil {
+		return nil, errors.New("prometheus no config ready")
+	}
+
+	scfgs, err := config.GetScrapeConfigs()
+	if err != nil {
+		return nil, err
+	}
+
+	scfgMap := make(map[string]*p8sconfig.ScrapeConfig)
+	for _, scfg := range scfgs {
+		scfgMap[scfg.JobName] = scfg
+	}
+
+	results := make([]*ScrapeTestResult, 0, len(jobNames))
+
+	testScfgs := make([]*p8sconfig.ScrapeConfig, 0, len(jobNames))
+	for _, name := range jobNames {
+		if testScfg := scfgMap[name]; testScfg != nil {
+			testScfgs = append(testScfgs, testScfg)
+		} else {
+			results = append(results, &ScrapeTestResult{
+				JobName: name,
+				Success: false,
+				Message: fmt.Sprintf("scrape config not found: [job=%s]", name),
+			})
+		}
+	}
+	config.ScrapeConfigFiles = make([]string, 0)
+	config.ScrapeConfigs = testScfgs
+
+	if len(config.ScrapeConfigs) > 0 {
+		if subResults, err := s.doTestScrapeWholeConfig(config); err != nil {
+			return results, err
+		} else {
+			results = append(results, subResults...)
+		}
+	}
+	return results, err
+}
+
+type TestScrapeConfigCmd struct {
+	Yaml        string            `json:"yaml"`
+	SecretFiles []secretFileInner `json:"secret_files"`
+}
+
+func (cmd *TestScrapeConfigCmd) Validate() errs.ValidateErrors {
+	ves := make(errs.ValidateErrors, 0)
+	if cmd.Yaml = strings.TrimSpace(cmd.Yaml); cmd.Yaml == "" {
+		ves = append(ves, "Yaml must not be blank")
+	}
+	for i, sf := range cmd.SecretFiles {
+		ves = append(ves, sf.Validate().Prefix(fmt.Sprintf("SecretFiles[%d].", i))...)
+	}
+	// 验证一下配置文件有没有问题
+	_, err := cmd.ToScrapeConfig()
+	if err != nil {
+		ves = append(ves, errs.ValidateError(err.Error()).Prefix("Invalid Yaml: "))
+	}
+	return ves
+}
+
+func (cmd *TestScrapeConfigCmd) ToScrapeConfig() (*p8sconfig.ScrapeConfig, error) {
+	cfg := &p8sconfig.ScrapeConfig{}
+	*cfg = p8sconfig.DefaultScrapeConfig
+
+	err := yaml.UnmarshalStrict([]byte(cmd.Yaml), cfg)
+	if err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+func (cmd *TestScrapeConfigCmd) getSecretFiles() []secretFileInner {
+	return cmd.SecretFiles
+}
+
+func (cmd *TestScrapeConfigCmd) setSecretFiles(sfs []secretFileInner) {
+	cmd.SecretFiles = sfs
+}
+
+func (s *sidecarService) TestScrapeConfig(cmd *TestScrapeConfigCmd) (*ScrapeTestResult, error) {
+	verrs := cmd.Validate()
+	if len(verrs) > 0 {
+		return nil, verrs
+	}
+
+	config := s.getConfigCopy()
+	if config == nil {
+		return nil, errors.New("prometheus no config ready")
+	}
+
+	tmpDir, err := os.MkdirTemp("", "prom-scrape-test")
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = os.RemoveAll(tmpDir)
+	}()
+
+	tmpConfigFile := filepath.Join(tmpDir, "prom-scrape-test.yml")
+	cfgFileUtil := &configFileUtil{configFile: tmpConfigFile}
+	oldNewSecretFileName := cfgFileUtil.normalizeSecretFiles(cmd)
+
+	config.ScrapeConfigFiles = make([]string, 0)
+	var scfg *p8sconfig.ScrapeConfig
+	if scfg, err = cmd.ToScrapeConfig(); err != nil {
+		return nil, err
+	} else {
+		config.ScrapeConfigs = []*p8sconfig.ScrapeConfig{scfg}
+	}
+	cfgFileUtil.updatePromConfigSecretFiles(config, oldNewSecretFileName)
+	if _, err = cfgFileUtil.writeSecretFiles(cmd.SecretFiles); err != nil {
+		return nil, err
+	}
+	scfg.SetDirectory(tmpDir) // 设定 basedir 为 tmpdir，否则会读不到文件的
+
+	if results, err := s.doTestScrapeWholeConfig(config); err != nil {
+		return nil, err
+	} else if len(results) == 0 {
+		return nil, errors.New("No test result")
+	} else {
+		return results[0], nil
+	}
+}
+
+func (s *sidecarService) doTestScrapeWholeConfig(cfg *p8sconfig.Config) ([]*ScrapeTestResult, error) {
+	s.discoverLock.Lock()
+	defer s.discoverLock.Unlock()
+
+	scfgs, err := cfg.GetScrapeConfigs()
+	if err != nil {
+		return nil, errors.Wrap(err, "Invalid scrape config")
+	}
+
+	if err := s.applyTestScrapeConfig(scfgs); err != nil {
+		return nil, errors.Wrap(err, "Apply scrape config to discover manager failed")
+	} else {
+		defer func() {
+			// 把 discovery manager 里的配置清空掉
+			err := s.applyTestScrapeConfig(nil)
+			if err != nil {
+				level.Error(s.logger).Log("msg", "Clear discovery manager config failed")
+			}
+		}()
+	}
+
+	// discoveryManager 关闭的时候不会 close 这个 channel，所以需要超时 ticker 来控制一下
+	tgSetsCh := s.discoveryManager.SyncCh()
+	ticker := time.NewTicker(time.Second * 30)
+	defer ticker.Stop()
+
+	var tgSet map[string][]*targetgroup.Group
+	select {
+	case tgSet = <-tgSetsCh:
+	case <-ticker.C:
+		// 没有在规定时间内得到 target group
+		// 目前 discoveryManager 没有提供得到发现目标时发生错误的机制，所以只能给一个大致错误
+		return nil, errors.New("Could not discover targets in 30s, see logs for more information")
+	}
+
+	results := make([]*ScrapeTestResult, len(scfgs))
+	for i, scfg := range scfgs {
+		results[i] = s.doTestScrapeConfig(scfg, tgSet[scfg.JobName])
+	}
+
+	return results, nil
+}
+
+func (s *sidecarService) doTestScrapeConfig(scfg *p8sconfig.ScrapeConfig, tgs []*targetgroup.Group) (jobRes *ScrapeTestResult) {
+	jobRes = &ScrapeTestResult{
+		JobName:        scfg.JobName,
+		Success:        false,
+		Error:          nil,
+		DiscoverErrors: make([]*testError, 0, 5),
+	}
+
+	// 把 target group 转换成 target
+	lb := labels.NewBuilder(labels.EmptyLabels())
+	var all []*scrape.Target
+	var targets []*scrape.Target
+	for _, tg := range tgs {
+		targets, failures := scrape.TargetsFromGroup(tg, scfg, s.scrapeOptions.NoDefaultPort, targets, lb)
+		for _, disErr := range failures {
+			jobRes.DiscoverErrors = append(jobRes.DiscoverErrors, &testError{disErr})
+		}
+		for _, t := range targets {
+			// Replicate .Labels().IsEmpty() with a loop here to avoid generating garbage.
+			nonEmpty := false
+			t.LabelsRange(func(l labels.Label) { nonEmpty = true })
+			if nonEmpty {
+				all = append(all, t)
+			}
+		}
+	}
+
+	if len(all) == 0 {
+		jobRes.Message = "no targets discovered"
+		return
+	}
+
+	// 下面开始的代码灵感来自于 scrape.scrapePool, scrapeLoop, targetScraper
+	// 每个 scrape config 对应一个 scrape/scrapePool
+	// scrape/scrapePool 为每个 target 维护一个 scrape/scrapeLoop
+	// scrape/scrapeLoop 内有一个 scrape/targetScraper（针对每个 target）
+	// scrape/targetScraper.scrape 真正负责抓指标
+
+	client, err := config_util.NewClientFromConfig(scfg.HTTPClientConfig, scfg.JobName, s.scrapeOptions.HTTPClientOptions...)
+	if err != nil {
+		jobRes.Message = "create http client error"
+		jobRes.Error = &testError{err}
+		return
+	}
+
+	jobRes.Success = true
+	jobRes.TargetResults = make([]*targetScrapeResult, 0, len(all))
+
+	// 使用并行的方式来测试
+	var wg sync.WaitGroup
+	for _, t := range all {
+		wg.Add(1)
+
+		go func(client *http.Client, t *scrape.Target, scfg *p8sconfig.ScrapeConfig) {
+			ts := s.newTargetScraper(client, t, scfg)
+			scrapeErr := s.doScrapeTarget(ts, time.Duration(scfg.ScrapeTimeout), scfg.ScrapeClassicHistograms)
+			if scrapeErr != nil {
+				jobRes.append(&targetScrapeResult{
+					Labels:           t.Labels(),
+					DiscoveredLabels: t.DiscoveredLabels(),
+					Success:          false,
+					Error:            &testError{scrapeErr},
+				})
+			} else {
+				jobRes.append(&targetScrapeResult{
+					Labels:           t.Labels(),
+					DiscoveredLabels: t.DiscoveredLabels(),
+					Success:          true,
+				})
+			}
+			wg.Done()
+		}(client, t, scfg)
+	}
+
+	wg.Wait()
+
+	if jobRes.Success {
+		jobRes.Message = "success"
+	}
+	return jobRes
+}
+
+const (
+	scrapeAcceptHeader             = `application/openmetrics-text;version=1.0.0,application/openmetrics-text;version=0.0.1;q=0.75,text/plain;version=0.0.4;q=0.5,*/*;q=0.1`
+	scrapeAcceptHeaderWithProtobuf = `application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited,application/openmetrics-text;version=1.0.0;q=0.8,application/openmetrics-text;version=0.0.1;q=0.75,text/plain;version=0.0.4;q=0.5,*/*;q=0.1`
+)
+
+func (s *sidecarService) newTargetScraper(client *http.Client, t *scrape.Target, scfg *p8sconfig.ScrapeConfig) *targetScraper {
+	var (
+		timeout       = time.Duration(scfg.ScrapeTimeout)
+		bodySizeLimit = int64(scfg.BodySizeLimit)
+	)
+	acceptHeader := scrapeAcceptHeader
+	if s.scrapeOptions.EnableProtobufNegotiation {
+		acceptHeader = scrapeAcceptHeaderWithProtobuf
+	}
+	ts := &targetScraper{Target: t, client: client, timeout: timeout, bodySizeLimit: bodySizeLimit, acceptHeader: acceptHeader}
+	return ts
+}
+
+func (s *sidecarService) doScrapeTarget(ts *targetScraper, timeout time.Duration, scrapeClassicHistograms bool) error {
+	// 以下代码 copy 自 scrape/scrapeLoop.scrapeAndReport
+	buf := bytes.NewBuffer(make([]byte, 1024))
+	defer buf.Reset()
+	scrapeCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	contentType, scrapeErr := ts.scrape(scrapeCtx, buf)
+	cancel()
+	if scrapeErr != nil {
+		return scrapeErr
+	}
+
+	// 通过正儿八级的解析来看返回结果是否有问题
+	// 以下代码 copy 自 scrape/scrapeLoop.append
+	p, err := textparse.New(buf.Bytes(), contentType, scrapeClassicHistograms)
+	if err != nil {
+		level.Debug(s.logger).Log(
+			"msg", "Invalid content type on scrape, using prometheus parser as fallback.",
+			"content_type", contentType,
+			"err", err,
+		)
+	}
+	var parseErr error
+	for {
+		if _, parseErr = p.Next(); parseErr != nil {
+			if errors.Is(parseErr, io.EOF) {
+				parseErr = nil
+			}
+			break
+		}
+	}
+
+	return parseErr
+}
+
+func (s *sidecarService) getConfigCopy() *p8sconfig.Config {
+	s.cfgLock.Lock()
+	defer s.cfgLock.Unlock()
+	if s.cfg == nil {
+		return nil
+	}
+	cfgCopy := *s.cfg
+	return &cfgCopy
+}
+
+// 给 discoveryManager 更新配置
+func (s *sidecarService) applyTestScrapeConfig(scfgs []*p8sconfig.ScrapeConfig) error {
+	c := make(map[string]discovery.Configs)
+	for _, v := range scfgs {
+		c[v.JobName] = v.ServiceDiscoveryConfigs
+	}
+	return s.discoveryManager.ApplyConfig(c)
+}
+
+type TestRemoteWriteConfigCmd struct {
+	Yaml        string            `json:"yaml"`
+	SecretFiles []secretFileInner `json:"secret_files"`
+}
+
+func (cmd *TestRemoteWriteConfigCmd) Validate() errs.ValidateErrors {
+	ves := make(errs.ValidateErrors, 0)
+	if cmd.Yaml = strings.TrimSpace(cmd.Yaml); cmd.Yaml == "" {
+		ves = append(ves, "Yaml must not be blank")
+	}
+	for i, sf := range cmd.SecretFiles {
+		ves = append(ves, sf.Validate().Prefix(fmt.Sprintf("SecretFiles[%d].", i))...)
+	}
+	// 验证一下配置文件有没有问题
+	_, err := cmd.ToRemoteWriteConfig()
+	if err != nil {
+		ves = append(ves, errs.ValidateError(err.Error()).Prefix("Invalid Yaml: "))
+	}
+	return ves
+}
+
+func (cmd *TestRemoteWriteConfigCmd) ToRemoteWriteConfig() (*p8sconfig.RemoteWriteConfig, error) {
+	cfg := &p8sconfig.RemoteWriteConfig{}
+	*cfg = p8sconfig.DefaultRemoteWriteConfig
+
+	err := yaml.UnmarshalStrict([]byte(cmd.Yaml), cfg)
+	if err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+func (cmd *TestRemoteWriteConfigCmd) getSecretFiles() []secretFileInner {
+	return cmd.SecretFiles
+}
+
+func (cmd *TestRemoteWriteConfigCmd) setSecretFiles(sfs []secretFileInner) {
+	cmd.SecretFiles = sfs
+}
+
+type RemoteWriteTestResult struct {
+	RemoteName string     `json:"remote_name"`
+	Success    bool       `json:"success"`
+	Message    string     `json:"message"`
+	Error      *testError `json:"error,omitempty"`
+}
+
+func (s *sidecarService) TestRemoteWriteConfig(cmd *TestRemoteWriteConfigCmd) (*RemoteWriteTestResult, error) {
+	verrs := cmd.Validate()
+	if len(verrs) > 0 {
+		return nil, verrs
+	}
+
+	config := s.getConfigCopy()
+	if config == nil {
+		return nil, errors.New("prometheus no config ready")
+	}
+
+	tmpDir, err := os.MkdirTemp("", "prom-remote-write-test")
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = os.RemoveAll(tmpDir)
+	}()
+
+	tmpConfigFile := filepath.Join(tmpDir, "prom-remote-write-test.yml")
+	cfgFileUtil := &configFileUtil{configFile: tmpConfigFile}
+	oldNewSecretFileName := cfgFileUtil.normalizeSecretFiles(cmd)
+
+	var rwConf *p8sconfig.RemoteWriteConfig
+	if rwConf, err = cmd.ToRemoteWriteConfig(); err != nil {
+		return nil, err
+	} else {
+		config.RemoteWriteConfigs = []*p8sconfig.RemoteWriteConfig{rwConf}
+	}
+	cfgFileUtil.updatePromConfigSecretFiles(config, oldNewSecretFileName)
+	if _, err = cfgFileUtil.writeSecretFiles(cmd.SecretFiles); err != nil {
+		return nil, err
+	}
+	rwConf.SetDirectory(tmpDir) // 设定 basedir 为 tmpdir，否则会读不到文件的
+
+	return s.doTestRemoteWriteConfig(rwConf), nil
+}
+
+type TestRemoteWriteRemotesCmd struct {
+	RemoteNames []string `json:"remote_names"`
+}
+
+func (s *sidecarService) TestRemoteWriteRemotes(remoteNames []string) ([]*RemoteWriteTestResult, error) {
+	if len(remoteNames) == 0 {
+		return nil, nil
+	}
+
+	config := s.getConfigCopy()
+	if config == nil {
+		return nil, errors.New("prometheus no config ready")
+	}
+
+	rwCfgMap := make(map[string]*p8sconfig.RemoteWriteConfig)
+	for _, rwCfg := range config.RemoteWriteConfigs {
+		rwCfgMap[rwCfg.Name] = rwCfg
+	}
+
+	remoteWriteResList := make([]*RemoteWriteTestResult, 0, len(remoteNames))
+
+	for _, name := range remoteNames {
+		if rwCfg := rwCfgMap[name]; rwCfg != nil {
+			remoteWriteResList = append(remoteWriteResList, s.doTestRemoteWriteConfig(rwCfg))
+		} else {
+			remoteWriteResList = append(remoteWriteResList, &RemoteWriteTestResult{
+				RemoteName: name,
+				Success:    false,
+				Message:    fmt.Sprintf("remote write config not found: [remote=%s]", name),
+				Error:      nil,
+			})
+		}
+	}
+
+	return remoteWriteResList, nil
+}
+
+func (s *sidecarService) doTestRemoteWriteConfig(rwCfg *p8sconfig.RemoteWriteConfig) *RemoteWriteTestResult {
+	remoteRes := &RemoteWriteTestResult{RemoteName: rwCfg.Name, Success: false}
+	c, err := remote.NewWriteClient(rwCfg.Name, &remote.ClientConfig{
+		URL:              rwCfg.URL,
+		Timeout:          rwCfg.RemoteTimeout,
+		HTTPClientConfig: rwCfg.HTTPClientConfig,
+		SigV4Config:      rwCfg.SigV4Config,
+		AzureADConfig:    rwCfg.AzureADConfig,
+		Headers:          rwCfg.Headers,
+		RetryOnRateLimit: rwCfg.QueueConfig.RetryOnRateLimit,
+	})
+	if err != nil {
+		remoteRes.Success = false
+		remoteRes.Message = "build remote write client failed"
+		remoteRes.Error = &testError{err}
+		return remoteRes
+	}
+
+	/*
+	  以下逻辑借鉴自 storage/remote/queue_manager.go:sendMetadataWithBackoff
+	*/
+
+	// 构建一个不知道可以干啥的 metric meta 上传一下看看
+	pmm := []prompb.MetricMetadata{{
+		MetricFamilyName: "_remote_write_test",
+		Help:             "remote write test only, doesn't mean anything",
+		Type:             prompb.MetricMetadata_INFO,
+		Unit:             "",
+	}}
+	pBuf := proto.NewBuffer(nil)
+	req, err := buildRemoteWriteRequest(pmm, pBuf)
+	if err != nil {
+		remoteRes.Success = false
+		remoteRes.Message = "build remote write request failed"
+		remoteRes.Error = &testError{err}
+		return remoteRes
+	}
+	testCtx, testCancel := context.WithTimeout(context.Background(), time.Duration(rwCfg.RemoteTimeout))
+	defer testCancel()
+	if err = c.Store(testCtx, req); err != nil {
+		remoteRes.Success = false
+		remoteRes.Message = "write to remote failed"
+		remoteRes.Error = &testError{err}
+		return remoteRes
+	}
+	remoteRes.Success = true
+	remoteRes.Message = "success"
+	return remoteRes
+}
+
+// copy 自 storage/remote/queue_manager.go:buildWriteRequest
+func buildRemoteWriteRequest(metadata []prompb.MetricMetadata, pBuf *proto.Buffer) ([]byte, error) {
+	req := &prompb.WriteRequest{
+		Metadata: metadata,
+	}
+
+	if pBuf == nil {
+		pBuf = proto.NewBuffer(nil) // For convenience in tests. Not efficient.
+	} else {
+		pBuf.Reset()
+	}
+	err := pBuf.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+
+	// snappy uses len() to see if it needs to allocate a new slice. Make the
+	// buffer as long as possible.
+	compressed := snappy.Encode(nil, pBuf.Bytes())
+	return compressed, nil
+}
+
+// discoveryManager interfaces the discovery manager. This is used to keep using
+// the manager that restarts SD's on reload for a few releases until we feel
+// the new manager can be enabled for all users.
+type discoveryManager interface {
+	ApplyConfig(cfg map[string]discovery.Configs) error
+	Run() error
+	SyncCh() <-chan map[string][]*targetgroup.Group
 }
